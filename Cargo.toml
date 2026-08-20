@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 clap = "4.6.6"
 wasmtime = "47.0.3"
+[profile.dev]
+incremental = true
+lto = false
