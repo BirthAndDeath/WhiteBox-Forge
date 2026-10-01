@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bevy = "0.19.1"
 clap = "4.6.6"
 whitebox_core = { path = "whitebox_core" }
 [profile.dev]
