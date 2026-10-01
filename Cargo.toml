@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-clap = "4.6.6"
+clap = "4.6.7"
+slint = "1.18.1"
 whitebox_core = { path = "whitebox_core" }
 [profile.dev]
 incremental = true
