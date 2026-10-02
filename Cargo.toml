@@ -8,6 +8,9 @@ anyhow = "1.0.104"
 clap = "4.6.7"
 slint = "1.18.1"
 whitebox_core = { path = "whitebox_core" }
+
+[build-dependencies]
+winresource = "0.1"
 [profile.dev]
 incremental = true
 lto = false

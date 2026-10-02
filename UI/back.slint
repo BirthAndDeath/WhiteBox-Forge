@@ -1,0 +1,15 @@
+export component Back inherits Rectangle {
+    callback back;
+    Image {
+        source: @image-url("../assets/back.png");
+        width: 90px;
+        height: 90px;
+        x: 30px;
+        y: 130px;
+        TouchArea {
+            clicked => {
+                back();
+            }
+        }
+    }
+}

@@ -1,0 +1,19 @@
+export component Start inherits Rectangle {
+    in-out property <bool> grow: false;
+
+    Image {
+        source: @image-url("../assets/startpng.png");
+        width: grow ? 192000px : 1920px;
+        height: grow ? 108000px : 1080px;
+        animate width { duration: 5000ms; }
+        animate height { duration: 5000ms; }
+    }
+
+    Timer {
+        interval: 1s;
+        running: true;
+        triggered => {
+            grow = true;
+        };
+    }
+}

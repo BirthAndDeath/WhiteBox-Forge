@@ -1,0 +1,54 @@
+import { Start } from "start.slint";
+import { Main } from "main.slint";
+import { Setting } from "setting.slint";
+import { Home } from "home.slint";
+import { Back } from "back.slint";
+component letsgo inherits Rectangle {
+    width: 1920px;
+    height: 1080px;
+    background: #ffffff;
+    in-out property <int> page:0;
+    Timer {
+        interval: 3500ms;
+        running: true;
+        triggered => {
+            page = 1;
+        }
+    }
+
+    if page == 0:Start { }
+    Main {
+
+        opacity: page == 1 ? 1.0 : 0.0;
+        animate opacity { duration: 200ms; }
+        appear: true;
+        back => {
+            root.page = 1;
+        }
+        home => {
+            root.page = 3;
+        }
+        setting => {
+            root.page = 2;
+        }
+    }
+
+    Back {
+        opacity: page > 1 ? 1.0 : 0.0;
+        animate opacity { duration: 200ms; }
+    }
+
+    Home {
+        opacity: page == 3 ? 1.0 : 0.0;
+        animate opacity { duration: 200ms; }
+    }
+
+    Setting {
+        opacity: page == 2 ? 1.0 : 0.0;
+        animate opacity { duration: 200ms; }
+    }
+}
+
+export component MainWindow inherits Window {
+    letsgo { }
+}
