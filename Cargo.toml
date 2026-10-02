@@ -13,6 +13,7 @@ whitebox_core = { path = "whitebox_core" }
 
 [build-dependencies]
 slint-build = "1.18.1"
+winresource = "0.1"
 [profile.dev]
 incremental = true
 lto = false
