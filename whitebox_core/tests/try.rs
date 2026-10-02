@@ -12,6 +12,6 @@ fn try_use() -> Result<(), wasmtime::error::Error> {
     "#;
     println!("If you see this, --nocapture is enabled!");
     let sandbox = load_wat_bytes(wat.into())?;
-    SandboxHandle::run_module(sandbox)?.join();
+    SandboxHandle::run_module(sandbox)?;
     Ok(())
 }
