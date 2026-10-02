@@ -1,0 +1,62 @@
+export component Main inherits Rectangle {
+    callback home;
+    callback setting;
+    callback fire;
+    callback back;
+    in-out property <bool> appear: false;
+
+    Image {
+        source: @image-url("../assets/fire.png");
+        width: 90px;
+        height: 100px;
+        x: 60px;
+        y: 700px;
+        opacity: appear ? 1.0 : 0.0;
+        animate opacity { duration: 400ms; }
+        TouchArea {
+            clicked => {
+                root.fire();
+            }
+        }
+    }
+
+    Image {
+        source: @image-url("../assets/home.png");
+        width: 90px;
+        height: 90px;
+        x: 60px;
+        y: 830px;
+        opacity: appear ? 1.0 : 0.0;
+        animate opacity { duration: 400ms; }
+        TouchArea {
+            clicked => {
+                root.home();
+            }
+        }
+    }
+
+    Image {
+        source: @image-url("../assets/setting.png");
+        width: 90px;
+        height: 90px;
+        x: 60px;
+        y: 960px;
+        opacity: appear ? 1.0 : 0.0;
+        animate opacity { duration: 400ms; }
+        TouchArea {
+            clicked => {
+                root.setting();
+            }
+        }
+    }
+
+    Text {
+        text: "白盒坊";
+        color: #000000;
+        font-size: 70px;
+        x: 20px;
+        y: 30px;
+        opacity: appear ? 1.0 : 0.0;
+        animate opacity { duration: 400ms; }
+    }
+}
