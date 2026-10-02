@@ -6226,6 +6226,7 @@ dependencies = [
 name = "whitebox-forge"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "slint",
  "whitebox_core",
@@ -6235,6 +6236,7 @@ dependencies = [
 name = "whitebox_core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "rayon",
  "wasmtime",
  "wasmtime-wasi",

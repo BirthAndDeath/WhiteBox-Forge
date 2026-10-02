@@ -1976,6 +1976,7 @@ dependencies = [
 name = "whitebox_core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "rayon",
  "wasmtime",
  "wasmtime-wasi",
