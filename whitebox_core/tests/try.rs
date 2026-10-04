@@ -1,6 +1,8 @@
 use whitebox_core::*;
 #[test]
 fn try_use() -> Result<(), wasmtime::error::Error> {
+    //标定全局状态（IS_WORKER 等），否则引擎初始化会 panic
+    init().expect("init must succeed");
     let wat = r#"
         (module
             (import "host" "host_func" (func $host_hello (param i32)))
@@ -11,7 +13,7 @@ fn try_use() -> Result<(), wasmtime::error::Error> {
         )
     "#;
     println!("If you see this, --nocapture is enabled!");
-    let sandbox = load_wat_bytes(wat.into())?;
+    let sandbox = load_wasm_bytes(wat.into())?;
     SandboxHandle::run_module(sandbox)?;
     Ok(())
 }
