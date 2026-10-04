@@ -1,7 +1,10 @@
+import { clr } from "clr.slint";
+
 export component Back inherits Rectangle {
     callback back;
     Image {
-        source: @image-url("../assets/back.png");
+        source: @image-url("../assets/back.svg");
+        colorize: clr.txt;
         width: 90px;
         height: 90px;
         x: 30px;

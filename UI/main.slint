@@ -1,12 +1,14 @@
+import { clr } from "clr.slint";
+
 export component Main inherits Rectangle {
     callback home;
     callback setting;
     callback fire;
-    callback back;
     in-out property <bool> appear: false;
 
     Image {
-        source: @image-url("../assets/fire.png");
+        source: @image-url("../assets/fire.svg");
+        colorize: clr.txt;
         width: 90px;
         height: 100px;
         x: 60px;
@@ -21,7 +23,8 @@ export component Main inherits Rectangle {
     }
 
     Image {
-        source: @image-url("../assets/home.png");
+        source: @image-url("../assets/home.svg");
+        colorize: clr.txt;
         width: 90px;
         height: 90px;
         x: 60px;
@@ -36,7 +39,8 @@ export component Main inherits Rectangle {
     }
 
     Image {
-        source: @image-url("../assets/setting.png");
+        source: @image-url("../assets/setting.svg");
+        colorize: clr.txt;
         width: 90px;
         height: 90px;
         x: 60px;
@@ -52,11 +56,130 @@ export component Main inherits Rectangle {
 
     Text {
         text: "白盒坊";
-        color: #000000;
+        color: clr.txt;
         font-size: 70px;
         x: 20px;
         y: 30px;
         opacity: appear ? 1.0 : 0.0;
         animate opacity { duration: 400ms; }
+    }
+
+    Rectangle {
+        x: 210px;
+        y: 230px;
+        width: 1560px;
+        height: 760px;
+        border-radius: 28px;
+        background: clr.panel;
+        border-width: 2px;
+        border-color: clr.panelb;
+
+        Rectangle {
+            x: 26px;
+            y: 26px;
+            width: 720px;
+            height: 420px;
+            border-radius: 22px;
+            background: clr.ad1;
+            border-width: 1px;
+            border-color: clr.ad1b;
+            Text {
+                text: "大图 1";
+                color: clr.txt;
+                font-size: 34px;
+                x: 30px;
+                y: 170px;
+            }
+        }
+
+        Rectangle {
+            x: 796px;
+            y: 26px;
+            width: 720px;
+            height: 420px;
+            border-radius: 22px;
+            background: clr.ad2;
+            border-width: 1px;
+            border-color: clr.ad2b;
+            Text {
+                text: "大图 2";
+                color: clr.txt;
+                font-size: 34px;
+                x: 30px;
+                y: 170px;
+            }
+        }
+
+        Rectangle {
+            x: 26px;
+            y: 470px;
+            width: 340px;
+            height: 220px;
+            border-radius: 18px;
+            background: clr.mini;
+            border-width: 1px;
+            border-color: clr.minib;
+            Text {
+                text: "小图 1";
+                color: clr.txt;
+                font-size: 24px;
+                x: 24px;
+                y: 100px;
+            }
+        }
+
+        Rectangle {
+            x: 392px;
+            y: 470px;
+            width: 340px;
+            height: 220px;
+            border-radius: 18px;
+            background: clr.mini;
+            border-width: 1px;
+            border-color: clr.minib;
+            Text {
+                text: "小图 2";
+                color: clr.txt;
+                font-size: 24px;
+                x: 24px;
+                y: 100px;
+            }
+        }
+
+        Rectangle {
+            x: 758px;
+            y: 470px;
+            width: 340px;
+            height: 220px;
+            border-radius: 18px;
+            background: clr.mini;
+            border-width: 1px;
+            border-color: clr.minib;
+            Text {
+                text: "小图 3";
+                color: clr.txt;
+                font-size: 24px;
+                x: 24px;
+                y: 100px;
+            }
+        }
+
+        Rectangle {
+            x: 1124px;
+            y: 470px;
+            width: 340px;
+            height: 220px;
+            border-radius: 18px;
+            background: clr.mini;
+            border-width: 1px;
+            border-color: clr.minib;
+            Text {
+                text: "小图 4";
+                color: clr.txt;
+                font-size: 24px;
+                x: 24px;
+                y: 100px;
+            }
+        }
     }
 }
