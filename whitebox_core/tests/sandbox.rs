@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+﻿use std::path::PathBuf;
 
-use whitebox_core::platform::{
+use whitebox_core::sandbox::{
     setup_sandbox_with, ApplyStatus, NetworkPorts, SandboxCapability, SandboxConfig,
 };
 
-/// setup 只应在真正的 worker 进程里跑一次（单向沙箱），这里为测试安全起见
-/// 只验证“空配置＝全 Skipped 的无副作用调用”。
+// setup 只应在真正的 worker 进程里跑一次（单向沙箱），这里为测试安全起见
+// 只验证“空配置＝全 Skipped 的无副作用调用”。
 #[test]
 fn default_config_is_a_noop() {
     let reports = setup_sandbox_with(&SandboxConfig::default());
@@ -37,7 +37,7 @@ fn validate_detects_network_mode_exclusivity() {
 fn validate_detects_sealed_fs_conflicts() {
     let mut cfg = SandboxConfig::default();
     cfg.deny_file_access = true;
-    cfg.fs_rules = vec![whitebox_core::platform::FsRule {
+    cfg.fs_rules = vec![whitebox_core::sandbox::FsRule {
         path: PathBuf::from("/tmp"),
         read: true,
         write: false,

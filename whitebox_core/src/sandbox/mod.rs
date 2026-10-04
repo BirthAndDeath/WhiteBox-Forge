@@ -226,7 +226,7 @@ pub type FsAccess = Vec<FsRule>;
 /// 构建示例：
 /// ```no_run
 /// use std::path::PathBuf;
-/// use whitebox_core::platform::{FsRule, NetworkPorts, SandboxConfig};
+/// use whitebox_core::sandbox::{FsRule, NetworkPorts, SandboxConfig};
 ///
 /// let config = SandboxConfig::new()
 ///     .allow_fs_read(PathBuf::from("/etc/hosts"))
