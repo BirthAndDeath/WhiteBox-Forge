@@ -170,25 +170,21 @@ fn apply_network_profile(config: &SandboxConfig) -> bool {
     apply_profile(rules)
 }
 
-/// 文件 profile：sealed 时全部拒绝；否则拒绝写（readonly）后按路径规则放行。
+/// 文件 profile：sealed / 路径授权都默认拒绝，再按授权规则逐条放行（deny-by-default + 显式 grant）。
 fn apply_fs_profile(config: &SandboxConfig) -> bool {
     let mut rules = vec![
         String::from("(version 1)"),
         String::from("(allow default)"),
     ];
 
-    if config.deny_file_access {
-        // 封闭文件系统：拒绝一切文件访问，且不再添加任何放行规则
+    let has_path_rules = !config.fs_rules.is_empty();
+    // 封闭基线：sealed 或存在路径授权时，默认拒绝全部文件访问
+    if config.deny_file_access || has_path_rules {
         rules.push(String::from("(deny file-read* file-write*)"));
-        return apply_profile(rules);
     }
-
-    if config.readonly_fs || !config.fs_rules.is_empty() {
-        // 全局只读 / 路径白名单都先拒绝写；白名单模式再拒绝读全部
+    // 全局只读：拒绝一切写入
+    if config.readonly_fs {
         rules.push(String::from("(deny file-write*)"));
-        if !config.fs_rules.is_empty() {
-            rules.push(String::from("(deny file-read*)"));
-        }
     }
 
     for rule in &config.fs_rules {
@@ -202,6 +198,7 @@ fn apply_fs_profile(config: &SandboxConfig) -> bool {
         }
     }
 
+    // 临时目录写放行（sealed 基线上的显式 grant）
     if config.temp_allow_write {
         let temp = std::env::temp_dir();
         if let Some(p) = temp.to_str() {

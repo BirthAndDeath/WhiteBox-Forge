@@ -236,7 +236,7 @@ pub type FsAccess = Vec<FsRule>;
 ///     .deny_exec(true)
 ///     .anti_debug(true);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxConfig {
     // ---- 文件系统 ----
     /// 路径级文件访问白名单
@@ -289,6 +289,51 @@ pub struct SandboxConfig {
     pub strict_handle_checks: bool,
 }
 
+impl Default for SandboxConfig {
+    /// 默认值：**全关闭 / Deny-by-Default** —— 每个能力都默认禁止，
+    /// 必须通过各 `with_*` 方法显式授权才能放行。
+    ///
+    /// ```
+    /// use whitebox_core::sandbox::SandboxConfig;
+    /// let cfg = SandboxConfig::default();
+    /// assert!(cfg.deny_network);
+    /// assert!(cfg.deny_file_access);
+    /// assert!(cfg.deny_exec);
+    /// assert!(cfg.no_new_privileges);
+    /// ```
+    fn default() -> Self {
+        Self {
+            // 文件系统：默认封闭（显式 allow_fs_read / allow_fs_read_write 按路径放行）
+            fs_rules: FsAccess::new(),
+            readonly_fs: false,
+            deny_file_access: true,
+            fs_root: None,
+            temp_allow_write: false,
+            // 网络：默认完全关闭（显式 allow_network_ports / loopback_only / dns_only 放行）
+            deny_network: true,
+            network_ports: NetworkPorts::Default,
+            localhost_only: false,
+            dns_only: false,
+            // 进程：默认禁执行 / 禁提权 / 防调试
+            deny_exec: true,
+            max_children: None,
+            no_new_privileges: true,
+            anti_debug: true,
+            // 资源上限：默认不额外限制（可经 builder 显式设定）
+            max_memory_bytes: None,
+            max_open_files: None,
+            max_cpu_ms: None,
+            max_file_size_bytes: None,
+            max_core_bytes: None,
+            // 内核加固属叠加选项，默认关闭（seccomp / Win32k / 签名 / 句柄）
+            strict_syscalls: false,
+            block_win32k: false,
+            block_non_microsoft_binaries: false,
+            strict_handle_checks: false,
+        }
+    }
+}
+
 impl SandboxConfig {
     /// 该能力是否被请求（新增能力时在此登记）。
     pub fn is_requested(&self, capability: SandboxCapability) -> bool {
@@ -320,42 +365,15 @@ impl SandboxConfig {
 
     /// 检查互斥 / 矛盾组合，返回冲突说明列表（空 = 合法）。
     ///
-    /// 网络四形态互斥；封闭文件系统（deny_file_access）与路径白名单 / 根重定向 / 临时写互斥；
-    /// anti_debug 与“允许 core dump”互斥；deny_exec 与 max_children 互斥。
+    /// 默认全关闭（deny-by-default）：`deny_file_access`/`deny_network` 是“基线拒绝”，
+    /// `fs_rules` / `network_ports` 等是**显式授权**，二者可以共存（基线下放行特定项）。
+    /// 仍互斥的组合：`deny_file_access` 与 `fs_root`；`fs_root` 与 `temp_allow_write`；
+    /// `anti_debug` 与“允许 core dump”；`deny_exec` 与 `max_children`。
     pub fn validate(&self) -> Vec<String> {
         let mut violations = Vec::new();
 
-        let network_modes = i32::from(self.deny_network)
-            + i32::from(self.network_ports.is_requested())
-            + i32::from(self.localhost_only)
-            + i32::from(self.dns_only);
-        if network_modes > 1 {
-            violations.push(
-                "网络模式互斥：deny_network / network_ports / localhost_only / dns_only \
-                 只能同时启用一个；需要只放行少数项目时请改用 network_ports::Allow 白名单"
-                    .into(),
-            );
-        }
-        if matches!(&self.network_ports, NetworkPorts::Allow(ranges) if ranges.is_empty()) {
-            violations.push(
-                "network_ports::Allow 白名单为空：没有任何端口可用，等价于 deny_network，\
-                 请直接使用 deny_network"
-                    .into(),
-            );
-        }
-        if self.deny_file_access {
-            if !self.fs_rules.is_empty() {
-                violations.push(
-                    "deny_file_access 与 fs_rules 互斥：封闭文件系统会拒绝一切文件访问，路径白名单无意义"
-                        .into(),
-                );
-            }
-            if self.fs_root.is_some() {
-                violations.push("deny_file_access 与 fs_root 互斥".into());
-            }
-            if self.temp_allow_write {
-                violations.push("deny_file_access 与 temp_allow_write 互斥".into());
-            }
+        if self.deny_file_access && self.fs_root.is_some() {
+            violations.push("deny_file_access 与 fs_root 互斥".into());
         }
         if self.fs_root.is_some() && self.temp_allow_write {
             violations.push(
@@ -379,7 +397,36 @@ impl SandboxConfig {
         violations
     }
 
-    /// 空配置（等价于 [`SandboxConfig::default`]）。配合各 `with_*` 链式构造。
+    /// 完全开放的空配置：所有能力默认**不限制**（等价于旧的全默认值）。
+    /// 与 [`SandboxConfig::default`]（全关闭）正好相反，用于明确表达“不套沙箱”。
+    pub fn open() -> Self {
+        Self {
+            fs_rules: FsAccess::new(),
+            readonly_fs: false,
+            deny_file_access: false,
+            fs_root: None,
+            temp_allow_write: false,
+            deny_network: false,
+            network_ports: NetworkPorts::Default,
+            localhost_only: false,
+            dns_only: false,
+            deny_exec: false,
+            max_children: None,
+            no_new_privileges: false,
+            anti_debug: false,
+            max_memory_bytes: None,
+            max_open_files: None,
+            max_cpu_ms: None,
+            max_file_size_bytes: None,
+            max_core_bytes: None,
+            strict_syscalls: false,
+            block_win32k: false,
+            block_non_microsoft_binaries: false,
+            strict_handle_checks: false,
+        }
+    }
+
+    /// 全关闭的默认配置（同 [`SandboxConfig::default`]，即“不授权就全不可用”）。
     pub fn new() -> Self {
         Self::default()
     }

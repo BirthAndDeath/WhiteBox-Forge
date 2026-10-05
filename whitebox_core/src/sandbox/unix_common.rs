@@ -167,9 +167,9 @@ pub fn landlock(
         }
     };
 
-    if !sealed {
-        if fs_rules.is_empty() {
-            // 无路径白名单：对 "/" 放行 read（+ 按需 write / exec）
+    if fs_rules.is_empty() {
+        // 无路径白名单：sealed 时不添加任何规则 → 全部拒绝；非 sealed 时对 "/" 放行 read（+ 按需 write/exec）
+        if !sealed {
             let mut allowed = read_bits;
             if !readonly_fs {
                 allowed |= write_bits;
@@ -186,46 +186,47 @@ pub fn landlock(
                 unsafe { libc::close(ruleset as i32) };
                 return false;
             }
-        } else {
-            // 路径白名单模式：每个规则添加一条能力规则
-            for rule in fs_rules {
-                if !rule.read && !rule.write {
-                    continue;
-                }
-                let mut allowed = read_bits;
-                if rule.read && !deny_exec {
-                    allowed |= LANDLOCK_ACCESS_FS_EXECUTE;
-                }
-                if rule.write && !readonly_fs {
-                    allowed |= write_bits;
-                }
-                let Ok(c_path) = CString::new(rule.path.as_os_str().as_bytes()) else {
-                    continue;
-                };
-                let fd = libc::open(c_path.as_ptr().cast(), libc::O_PATH);
-                if fd < 0 {
-                    continue; // 路径不存在或不可达：跳过（该条能力授予失败而非整体失败）
-                }
-                let ok = add_rule(fd, allowed);
+        }
+    } else {
+        // 路径授权模式（sealed 基线上的显式 grant）：为每个授权路径添加能力规则，
+        // 未授权的路径在基线（sealed/只读/禁执行）下依然被拒
+        for rule in fs_rules {
+            if !rule.read && !rule.write {
+                continue;
+            }
+            let mut allowed = read_bits;
+            if rule.read && !deny_exec {
+                allowed |= LANDLOCK_ACCESS_FS_EXECUTE;
+            }
+            if rule.write && !readonly_fs {
+                allowed |= write_bits;
+            }
+            let Ok(c_path) = CString::new(rule.path.as_os_str().as_bytes()) else {
+                continue;
+            };
+            let fd = libc::open(c_path.as_ptr().cast(), libc::O_PATH);
+            if fd < 0 {
+                continue; // 路径不存在或不可达：跳过（该条能力授予失败而非整体失败）
+            }
+            let ok = add_rule(fd, allowed);
+            unsafe { libc::close(fd) };
+            if !ok {
+                unsafe { libc::close(ruleset as i32) };
+                return false;
+            }
+        }
+    }
+
+    // 临时目录写放行（sealed 基线上的显式 grant）
+    if temp_allow_write && !readonly_fs {
+        if let Ok(temp) = CString::new(std::env::temp_dir().as_os_str().as_bytes()) {
+            let fd = libc::open(temp.as_ptr().cast(), libc::O_PATH);
+            if fd >= 0 {
+                let ok = add_rule(fd, read_bits | write_bits);
                 unsafe { libc::close(fd) };
                 if !ok {
                     unsafe { libc::close(ruleset as i32) };
                     return false;
-                }
-            }
-        }
-
-        // 临时目录写放行（readonly / 白名单场景下的补充能力）
-        if temp_allow_write && !readonly_fs {
-            if let Ok(temp) = CString::new(std::env::temp_dir().as_os_str().as_bytes()) {
-                let fd = libc::open(temp.as_ptr().cast(), libc::O_PATH);
-                if fd >= 0 {
-                    let ok = add_rule(fd, read_bits | write_bits);
-                    unsafe { libc::close(fd) };
-                    if !ok {
-                        unsafe { libc::close(ruleset as i32) };
-                        return false;
-                    }
                 }
             }
         }
