@@ -55,9 +55,11 @@ pub fn init() -> anyhow::Result<()> {
 ///基于环境变量识别，启动自己的进程来为自己打工（
 fn run_worker() -> anyhow::Result<()> {
     let mut stdin = std::io::stdin().lock();
-    //协议：三帧 [wasm 路径][输入字节][沙箱配置字节]
-    let wasm_path = read_string(&mut stdin)?;
-    let input = read_bytes(&mut stdin)?;
+    //协议：三帧（payload 均 postcard 序列化）[wasm 路径 PathBuf][输入字节 Vec<u8>][沙箱配置]
+    let wasm_path_bytes = read_bytes(&mut stdin)?;
+    let wasm_path: PathBuf = postcard::from_bytes(&wasm_path_bytes)?;
+    let input_bytes = read_bytes(&mut stdin)?;
+    let input: Vec<u8> = postcard::from_bytes(&input_bytes)?;
     let config_bytes = read_bytes(&mut stdin)?;
     if !config_bytes.is_empty() {
         //父进程传入的沙箱参数 → 全局配置
@@ -68,7 +70,7 @@ fn run_worker() -> anyhow::Result<()> {
     //先应用全局进程沙箱配置，不支持的配置项会打进 stderr 供审计
     apply_sandbox();
     //connect channel
-    run_wasm(wasm_path.into(), &input)?;
+    run_wasm(wasm_path, &input)?;
     anyhow::Ok(())
 }
 
@@ -91,16 +93,6 @@ fn run_wasm(path: PathBuf, input: &Vec<u8>) -> anyhow::Result<()> {
     anyhow::Ok(())
 }
 use std::io::Read;
-
-/// 从流里读一个 u32 长度前缀 + UTF-8 字符串
-fn read_string(r: &mut impl Read) -> std::io::Result<String> {
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
 
 /// 从流里读一个 u32 长度前缀 + 字节数组
 fn read_bytes(r: &mut impl Read) -> Result<Vec<u8>> {
@@ -320,13 +312,16 @@ impl SandboxHandle {
 
         match spawn_command_result {
             Ok(mut child) => {
-                // 写入三帧：wasm 路径 / 输入(空) / 沙箱配置，随后关闭 stdin 让 worker 读到 EOF
+                // 写入三帧（payload 均 postcard 序列化，保证无损）：wasm 路径(PathBuf) / 输入字节(Vec<u8>) / 沙箱配置
                 let write_result = (|| -> anyhow::Result<()> {
                     let Some(mut stdin) = child.stdin.take() else {
                         anyhow::bail!("worker stdin unavailable");
                     };
-                    write_frame(&mut stdin, path.to_string_lossy().as_bytes())?;
-                    write_frame(&mut stdin, &[])?;
+                    let wasm_path_bytes = postcard::to_stdvec(&path)?;
+                    write_frame(&mut stdin, &wasm_path_bytes)?;
+                    let input: Vec<u8> = Vec::new();
+                    let input_bytes = postcard::to_stdvec(&input)?;
+                    write_frame(&mut stdin, &input_bytes)?;
                     let config_bytes = postcard::to_stdvec(config)?;
                     write_frame(&mut stdin, &config_bytes)?;
                     drop(stdin);
