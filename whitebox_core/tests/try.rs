@@ -1,7 +1,7 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use whitebox_core::sandbox::SandboxConfig;
 use whitebox_core::*;
-use whitebox_core::{SandboxHandle, ThreadCommand};
+use whitebox_core::{SandboxHandle};
+
 #[test]
 fn try_use() -> Result<(), Box<dyn std::error::Error>> {
     //标定全局状态（IS_WORKER 等），否则引擎初始化会 panic
@@ -26,16 +26,13 @@ fn try_use() -> Result<(), Box<dyn std::error::Error>> {
         )
     "#;
     println!("If you see this, --nocapture is enabled!");
-    // 加载 + 运行在同一个 current-thread runtime 内闭环（thread 路径，避免嵌套 runtime）
-    let module = load_wasm_bytes(wat.into())?;
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let (_tx, rx) = tokio::sync::watch::channel(ThreadCommand::Empty);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(async {
-        let sandbox = load_module_for_thread(module, shutdown_flag).await?;
-        SandboxHandle::run_module_for_thread(sandbox, rx).await
-    })?;
+
+    // 集成测试进程的 current_exe() 是测试二进制，spawn 成 worker 会递归跑测试，
+    // 因此强制 `run_data` 的线程回退路径（进程 worker 链路由真机/后续端到端测试覆盖）。
+    // SAFETY: 测试早期单线程阶段设置；无并发读该变量的场景。
+    unsafe { std::env::set_var("WHITEBOX_FORCE_THREAD_FALLBACK", "1") };
+
+    let runner = SandboxHandle::run_data(wat.as_bytes().to_vec(), &SandboxConfig::open())?;
+    runner.wait()?;
     Ok(())
 }

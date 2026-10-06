@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::any;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -129,14 +130,21 @@ pub fn init() -> anyhow::Result<()> {
     IS_WORKER.get_or_init(|| Arc::new(AtomicBool::new(false)));
     anyhow::Ok(())
 }
+/// worker 协议帧 1 的载荷：wasm 按文件路径传输，还是整段字节传输。
+/// 字节路径无需落盘、也不依赖文件系统授权（默认封闭文件系统下也能跑）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum WasmSource {
+    Path(PathBuf),
+    Bytes(Vec<u8>),
+}
+
 ///基于环境变量识别，启动自己的进程来为自己打工（
 fn run_worker() -> Result<(), WorkerError> {
     let mut stdin = std::io::stdin().lock();
-    //协议：三帧（payload 均 postcard 序列化）[wasm 路径 PathBuf][输入字节 Vec<u8>][沙箱配置]
-    let wasm_path_bytes =
-        read_bytes(&mut stdin).map_err(|e| WorkerError::new(WorkerExit::Io, e))?;
-    let wasm_path: PathBuf = postcard::from_bytes(&wasm_path_bytes)
-        .map_err(|e| WorkerError::new(WorkerExit::Decode, e))?;
+    //协议：三帧（payload 均 postcard 序列化）[模块源 WasmSource][输入字节 Vec<u8>][沙箱配置]
+    let source_bytes = read_bytes(&mut stdin).map_err(|e| WorkerError::new(WorkerExit::Io, e))?;
+    let source: WasmSource =
+        postcard::from_bytes(&source_bytes).map_err(|e| WorkerError::new(WorkerExit::Decode, e))?;
     let input_bytes = read_bytes(&mut stdin).map_err(|e| WorkerError::new(WorkerExit::Io, e))?;
     let input: Vec<u8> =
         postcard::from_bytes(&input_bytes).map_err(|e| WorkerError::new(WorkerExit::Decode, e))?;
@@ -156,7 +164,7 @@ fn run_worker() -> Result<(), WorkerError> {
     //先应用全局进程沙箱配置，不支持的配置项会打进 stderr 供审计
     apply_sandbox();
     //connect channel
-    run_wasm(wasm_path, &input)
+    run_wasm(source, &input)
 }
 
 /// 应用全局沙箱配置并输出不支持项的警告
@@ -171,8 +179,17 @@ fn apply_sandbox() {
     }
 }
 //阻塞运行
-fn run_wasm(path: PathBuf, input: &Vec<u8>) -> Result<(), WorkerError> {
-    let module = load_from_wasm_file(&path).map_err(|e| WorkerError::new(WorkerExit::Load, e))?;
+fn run_wasm(source: WasmSource, input: &Vec<u8>) -> Result<(), WorkerError> {
+    let module = match source {
+        // 路径来源需要父进程在 spawn 前显式授权读取（默认全关闭文件系统）
+        WasmSource::Path(path) => {
+            load_from_wasm_file(&path).map_err(|e| WorkerError::new(WorkerExit::Load, e))?
+        }
+        // 字节来源不经文件系统，默认封闭文件系统下也能运行
+        WasmSource::Bytes(bytes) => {
+            Module::new(&ENGINE, bytes).map_err(|e| WorkerError::new(WorkerExit::Load, e))?
+        }
+    };
     let sandbox = load_module_for_worker(module, Arc::new(AtomicBool::new(false)))
         .map_err(|e| WorkerError::new(WorkerExit::Instantiate, e))?; //后面的flag在此处是无用的
     SandboxHandle::run_module_for_worker(sandbox)
@@ -238,9 +255,10 @@ pub enum Runner {
     ),
     Process(Child),
 }
+/// 运行句柄：由 [`SandboxHandle::run`] / [`SandboxHandle::run_data`] 取得，
+/// 提供 `wait`（等待结果）与 `shutdown`（主动终止）两个收敛入口。
 pub struct SandboxHandle {
     runner: Runner,
-    wasm_sandbox: WasmSandbox<HostState>,
 }
 
 pub fn load_from_wasm_file(path: &Path) -> Result<Module, wasmtime::Error> {
@@ -331,6 +349,35 @@ use crate::Runner::{Process, Thread};
 use wasmtime::{StoreContextMut, UpdateDeadline};
 
 impl SandboxHandle {
+    /// 等待运行结束并返回结果。
+    /// - `Thread`：join 线程，合并内部错误；
+    /// - `Process`：`wait` 子进程，按 [`WorkerExit`] 解码退出码（非 0 视为失败）。
+    pub fn wait(self) -> anyhow::Result<()> {
+        match self.runner {
+            Runner::Thread(joinhandle, _) => joinhandle
+                .join()
+                .map_err(|_| anyhow::anyhow!("worker thread panicked"))?
+                .map_err(|e| anyhow::anyhow!("{e}")),
+            Runner::Process(mut child) => {
+                let status = child.wait()?;
+                if status.success() {
+                    return Ok(());
+                }
+                match status.code() {
+                    Some(code) => match WorkerExit::decode(code) {
+                        Ok(worker_exit) => {
+                            anyhow::bail!("worker failed (exit {code}: {:?})", worker_exit)
+                        }
+                        Err(unknown) => {
+                            anyhow::bail!("worker failed with unknown exit code {unknown}")
+                        }
+                    },
+                    None => anyhow::bail!("worker terminated by signal"),
+                }
+            }
+        }
+    }
+
     pub fn shutdown(self) -> anyhow::Result<()> {
         match self.runner {
             Thread(joinhandle, (tx, shutdown_requested)) => {
@@ -345,17 +392,29 @@ impl SandboxHandle {
         }
         Ok(())
     }
-    /// 以独立 worker 进程运行指定 wasm，并把沙箱参数作为第三帧传给 worker。
+    /// 以独立 worker 进程运行指定 wasm **文件**，并把沙箱参数作为第三帧传给 worker。
     /// 进程创建失败时回落到线程模式（相机应对）。
     ///
     /// 注意：`SandboxConfig::default()` 是 **全关闭**（`deny_file_access=true`）。
-    /// 在 Linux/macOS 上，worker 应用沙箱后 `run_wasm` 仍需读取该 wasm 文件路径，
+    /// 在 Linux/macOS 上，worker 应用沙箱后仍需读取该 wasm 文件路径，
     /// 因此 spawn 前必须显式授权，例如：
     /// `let cfg = SandboxConfig::new().allow_fs_read(parent_dir_of_wasm);`
     /// 说明：Linux Landlock 是“路径层级 + 祖先遍历”授权，只给 wasm 文件本身授权，
     /// 遍历其祖先目录仍会被拒，建议直接授权 wasm 所在目录的读权限；
     /// macOS seatbelt 用 `(allow file-read* (subpath "…"))` 直接对该路径生效，无需祖先授权。
-    pub fn run(path: PathBuf, config: &SandboxConfig) -> anyhow::Result<Runner> {
+    ///
+    /// 若不想授文件路径权限，请改用 [`SandboxHandle::run_data`]（字节直传，不落盘）。
+    pub fn run(path: PathBuf, config: &SandboxConfig) -> anyhow::Result<SandboxHandle> {
+        Self::run_source(&WasmSource::Path(path), config)
+    }
+
+    /// 以独立 worker 进程运行内存中的 wasm 字节（不落盘、走字节帧传输，
+    /// 默认封闭文件系统下也无需授权路径）。其余行为与 [`SandboxHandle::run`] 一致。
+    pub fn run_data(data: Vec<u8>, config: &SandboxConfig) -> anyhow::Result<SandboxHandle> {
+        Self::run_source(&WasmSource::Bytes(data), config)
+    }
+
+    fn run_source(source: &WasmSource, config: &SandboxConfig) -> anyhow::Result<SandboxHandle> {
         // set self exe path
         #[cfg(target_os = "linux")]
         let exe = std::path::PathBuf::from("/proc/self/exe"); //更安全
@@ -375,20 +434,39 @@ impl SandboxHandle {
             let sys = system_root.to_string_lossy();
             command.env("PATH", format!("{sys}\\System32;{sys}"));
         }
-        let spawn_command_result = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn();
+        // 调试/集成测试钩子：WHITEBOX_FORCE_THREAD_FALLBACK=1 强制走线程回退。
+        // 仅 debug 构建生效（release 编译掉，避免生产被会话级 env 静默降级）。如果有需求再开
+        // 该变量只被父进程读取；worker 经 env_clear() 启动，不会继承，也不读它。
+        let spawn_command_result = {
+            #[cfg(debug_assertions)]
+            {
+                if std::env::var_os("WHITEBOX_FORCE_THREAD_FALLBACK").is_some() {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "WHITEBOX_FORCE_THREAD_FALLBACK set",
+                    ))
+                } else {
+                    command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
+                }
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
+            }
+        };
         //匿名通道相对安全，如果这个都保证不了安全的情况我觉得好像也没什么其它办法可以保护了（）
         //我反正思考了半天，发现好像能对本应用进行攻击的应用基本上也啥都能干了，防护好像没啥用（（（
         //只能说尽可能保证安全吧
 
         match spawn_command_result {
             Ok(mut child) => {
-                // 写入三帧（payload 均 postcard 序列化，保证无损）：wasm 路径(PathBuf) / 输入字节(Vec<u8>) / 沙箱配置
+                // 写入三帧（payload 均 postcard 序列化，保证无损）：模块源(WasmSource) / 输入字节(Vec<u8>) / 沙箱配置
                 let write_result = (|| -> anyhow::Result<()> {
                     let Some(mut stdin) = child.stdin.take() else {
                         anyhow::bail!("worker stdin unavailable");
                     };
-                    let wasm_path_bytes = postcard::to_stdvec(&path)?;
-                    write_frame(&mut stdin, &wasm_path_bytes)?;
+                    let source_bytes = postcard::to_stdvec(source)?;
+                    write_frame(&mut stdin, &source_bytes)?;
                     let input: Vec<u8> = Vec::new();
                     let input_bytes = postcard::to_stdvec(&input)?;
                     write_frame(&mut stdin, &input_bytes)?;
@@ -401,12 +479,15 @@ impl SandboxHandle {
                     let _ = child.kill();
                     return Err(e);
                 }
-                anyhow::Ok(Runner::Process(child))
+                anyhow::Ok(SandboxHandle {
+                    runner: Runner::Process(child),
+                })
             }
             Err(_) => {
                 //创建进程失败，回落到创建线程
 
                 let config = config.clone();
+                let source = source.clone();
                 let shutdown_flag_for_thread = Arc::new(AtomicBool::new(false));
                 let shutdown_flag_clone = shutdown_flag_for_thread.clone();
                 let (tx, mut rx) = watch::channel(ThreadCommand::Empty); //信号
@@ -419,7 +500,10 @@ impl SandboxHandle {
                         .enable_all()
                         .build()?;
                     let result = rt.block_on(async move {
-                        let module = load_from_wasm_file(&path)?;
+                        let module = match source {
+                            WasmSource::Path(path) => load_from_wasm_file(&path)?,
+                            WasmSource::Bytes(bytes) => Module::new(&ENGINE, bytes)?,
+                        };
                         let sandbox = load_module_for_thread(module, shutdown_flag_clone).await?;
                         Self::run_module_for_thread(sandbox, rx).await
                     });
@@ -427,7 +511,9 @@ impl SandboxHandle {
 
                     Ok(())
                 });
-                anyhow::Ok(Runner::Thread(thread, (tx, shutdown_flag_for_thread)))
+                anyhow::Ok(SandboxHandle {
+                    runner: Runner::Thread(thread, (tx, shutdown_flag_for_thread)),
+                })
             }
         }
     }
