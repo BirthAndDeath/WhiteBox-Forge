@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::any;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -14,14 +13,6 @@ static ENGINE: LazyLock<Engine> =
     LazyLock::new(|| Engine::new(&get_engine_config()).expect("failed to init wasmtime engine"));
 //懒加载，在init初始化后才应该被读取
 static IS_WORKER: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-use rayon::ThreadPoolBuilder;
-
-static THREADPOOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
-    ThreadPoolBuilder::new()
-        .num_threads(0 /*表示自动处理 */)
-        .build()
-        .unwrap()
-});
 
 fn get_engine_config() -> wasmtime::Config {
     let mut config = Config::new();
@@ -217,6 +208,7 @@ pub struct WasmSandbox<T: 'static> {
     instance: Instance,
     store: Store<T>,
 }
+// 签名/内容校验的占位结构，后续接入
 pub struct WasmMetadata {
     pubkey: Option<Vec<u8>>,
     signature: Option<Vec<u8>>,
@@ -380,14 +372,14 @@ impl SandboxHandle {
 
     pub fn shutdown(self) -> anyhow::Result<()> {
         match self.runner {
-            Thread(joinhandle, (tx, shutdown_requested)) => {
+            Thread(joinhandle, (_tx, shutdown_requested)) => {
                 shutdown_requested.store(true, Ordering::Relaxed); //写入关闭标记
                 ENGINE.to_owned().increment_epoch(); //直接调用计数，但不保证一定能立刻杀掉。直接搞会导致全误杀，我添加一个回调atomicbool检查来处理误杀。
-                joinhandle.join(); //这个错误需要传播吗？我先想想，之后再说。喵喵喵喵喵喵喵喵喵！
+                let _ = joinhandle.join(); //这个错误需要传播吗？我先想想，之后再说。喵喵喵喵喵喵喵喵喵！
             }
             Process(mut child) => {
-                child.kill();
-                child.wait();
+                let _ = child.kill();
+                let _ = child.wait();
             }
         }
         Ok(())
@@ -490,7 +482,7 @@ impl SandboxHandle {
                 let source = source.clone();
                 let shutdown_flag_for_thread = Arc::new(AtomicBool::new(false));
                 let shutdown_flag_clone = shutdown_flag_for_thread.clone();
-                let (tx, mut rx) = watch::channel(ThreadCommand::Empty); //信号
+                let (tx, rx) = watch::channel(ThreadCommand::Empty); //信号
                 let thread = std::thread::spawn(move || -> Result<()> {
                     //线程模式没有任何进程隔离，仅尽力应用沙箱限制
                     let _ = set_sandbox_config(config);
@@ -518,7 +510,7 @@ impl SandboxHandle {
         }
     }
     fn epoch_callback(
-        mut ctx: StoreContextMut<'_, HostState>,
+        ctx: StoreContextMut<'_, HostState>,
     ) -> std::result::Result<UpdateDeadline, wasmtime::Error> {
         let data = ctx.data(); //拿到储存到hoststate的数据
         if data
