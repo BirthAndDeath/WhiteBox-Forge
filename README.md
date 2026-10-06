@@ -50,8 +50,8 @@ Key design decisions:
 - Workers communicate over stdin/stdout using length-prefixed frames (a `u32` length followed by the payload), isolating untrusted workloads behind a simple protocol.
 - worker 之间通过 stdin/stdout 以长度前缀帧（`u32` 长度 + 载荷）通信，将不受信任的工作负载隔离在简单协议之后。
 
-- Platform-specific sandbox primitives live in `whitebox_core/src/platform/` and degrade gracefully instead of relying on hard compile-time feature splits.
-- 平台相关的沙箱原语位于 `whitebox_core/src/platform/`，通过逐级回退优雅降级，而非依赖硬编码的编译期平台分支。
+- Platform-specific sandbox primitives live in `whitebox_core/src/sandbox/` and degrade gracefully instead of relying on hard compile-time feature splits.
+- 平台相关的沙箱原语位于 `whitebox_core/src/sandbox/`，通过逐级回退优雅降级，而非依赖硬编码的编译期平台分支。
 
 ## Getting Started / 快速开始
 
@@ -85,7 +85,7 @@ cargo run
 ├── whitebox_core/
 │   ├── src/
 │   │   ├── lib.rs      # Engine, loader, and worker protocol / 引擎、加载器与 worker 协议
-│   │   └── platform/   # OS-specific sandbox backends / 各平台沙箱后端
+│   │   └── sandbox/   # OS-specific sandbox backends / 各平台沙箱后端
 │   └── tests/          # Integration tests / 集成测试
 ├── assets/             # Icons and UI assets / 图标与 UI 资源
 ├── build.rs            # Windows icon embedding / Windows 图标嵌入
