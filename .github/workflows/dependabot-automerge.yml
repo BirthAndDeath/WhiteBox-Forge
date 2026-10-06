@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 30
     if: github.actor == 'dependabot[bot]'
     steps:
-      - uses: dependabot/fetch-metadata@v2
+      - uses: dependabot/fetch-metadata@v3
         id: metadata
 
       # 合并前必须等必需检查（clippy/fmt/test/audit）通过；任一失败则本步退出非零 → 跳过自动合并
