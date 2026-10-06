@@ -218,6 +218,47 @@ impl FsRule {
 /// 非空表示“只允许这些路径按规则访问，未列出的路径默认拒绝”。
 pub type FsAccess = Vec<FsRule>;
 
+/// WASI 标准流模式（L2，guest 可见的 stdio）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WasiStdio {
+    /// 继承宿主进程的对应流
+    #[default]
+    Inherit,
+    /// 捕获到内存（供后续结果通道读取；尚未接线检索）
+    Capture,
+    /// 丢弃（null）
+    Null,
+}
+
+/// WASI 预打开目录（细粒度：guest 路径 + 读/写权限）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WasiPreopen {
+    /// 宿主端目录（必须可被进程沙箱读取/写入，否则配置失败 → 报错终止）
+    pub host_path: PathBuf,
+    /// guest 侧可见路径
+    pub guest_path: String,
+    /// 允许读
+    pub read: bool,
+    /// 允许写
+    pub write: bool,
+}
+
+impl WasiPreopen {
+    pub fn new(
+        host_path: impl Into<PathBuf>,
+        guest_path: impl Into<String>,
+        read: bool,
+        write: bool,
+    ) -> Self {
+        Self {
+            host_path: host_path.into(),
+            guest_path: guest_path.into(),
+            read,
+            write,
+        }
+    }
+}
+
 /// 统一的进程沙箱限制配置（尽可能细粒度、广兼容）。
 ///
 /// 冲突组合由 [`SandboxConfig::validate`] 拦截，开发期通过 [`setup_sandbox_with`]
@@ -236,6 +277,10 @@ pub type FsAccess = Vec<FsRule>;
 ///     .deny_exec(true)
 ///     .anti_debug(true);
 /// ```
+///
+/// ## L1（进程/OS 沙箱）与 L2（WASI）的失败语义不同
+/// - L1（`setup_sandbox`）：尽力而为，配置失败只报告不中止（已无法再收紧）；
+/// - L2（WASI，`wasi_*` 字段）：**必须成功配置**，失败即报错终止（fail-closed）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxConfig {
     // ---- 文件系统 ----
@@ -287,6 +332,19 @@ pub struct SandboxConfig {
     pub block_non_microsoft_binaries: bool,
     /// Windows: 严格句柄校验
     pub strict_handle_checks: bool,
+    // ---- WASI（L2，配置失败必须报错终止；默认最小 = 继承 stdio、无 env/args/preopen）----
+    /// WASI 标准输入
+    pub wasi_stdin: WasiStdio,
+    /// WASI 标准输出
+    pub wasi_stdout: WasiStdio,
+    /// WASI 标准错误
+    pub wasi_stderr: WasiStdio,
+    /// WASI 可见的环境变量（显式白名单，不继承宿主）
+    pub wasi_env: Vec<(String, String)>,
+    /// WASI 命令行参数
+    pub wasi_args: Vec<String>,
+    /// WASI 预打开目录（细粒度 guest 路径 + 读写权限）
+    pub wasi_preopens: Vec<WasiPreopen>,
 }
 
 impl Default for SandboxConfig {
@@ -330,6 +388,13 @@ impl Default for SandboxConfig {
             block_win32k: false,
             block_non_microsoft_binaries: false,
             strict_handle_checks: false,
+            // WASI：默认最小 —— 继承 stdio，无 env/args/preopen
+            wasi_stdin: WasiStdio::Inherit,
+            wasi_stdout: WasiStdio::Inherit,
+            wasi_stderr: WasiStdio::Inherit,
+            wasi_env: Vec::new(),
+            wasi_args: Vec::new(),
+            wasi_preopens: Vec::new(),
         }
     }
 }
@@ -375,6 +440,11 @@ impl SandboxConfig {
         if self.deny_file_access && self.fs_root.is_some() {
             violations.push("deny_file_access 与 fs_root 互斥".into());
         }
+        if self.deny_file_access && !self.wasi_preopens.is_empty() {
+            violations.push(
+                "deny_file_access 与 wasi_preopens 冲突：封闭文件系统下任何目录都无法预打开".into(),
+            );
+        }
         if self.fs_root.is_some() && self.temp_allow_write {
             violations.push(
                 "fs_root 与 temp_allow_write 互斥：chroot/根重定向后系统临时目录已重映射到根内部"
@@ -389,9 +459,8 @@ impl SandboxConfig {
             );
         }
         if self.deny_exec && self.max_children.is_some() {
-            violations.push(
-                "deny_exec 与 max_children 互斥：deny_exec 已隐含 0 个子进程上限".into(),
-            );
+            violations
+                .push("deny_exec 与 max_children 互斥：deny_exec 已隐含 0 个子进程上限".into());
         }
 
         violations
@@ -423,12 +492,63 @@ impl SandboxConfig {
             block_win32k: false,
             block_non_microsoft_binaries: false,
             strict_handle_checks: false,
+            wasi_stdin: WasiStdio::Inherit,
+            wasi_stdout: WasiStdio::Inherit,
+            wasi_stderr: WasiStdio::Inherit,
+            wasi_env: Vec::new(),
+            wasi_args: Vec::new(),
+            wasi_preopens: Vec::new(),
         }
     }
 
     /// 全关闭的默认配置（同 [`SandboxConfig::default`]，即“不授权就全不可用”）。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // ---- WASI 配置（L2：配置失败必须报错终止）----
+
+    /// WASI 标准输入模式
+    pub fn wasi_stdin(mut self, mode: WasiStdio) -> Self {
+        self.wasi_stdin = mode;
+        self
+    }
+
+    /// WASI 标准输出模式
+    pub fn wasi_stdout(mut self, mode: WasiStdio) -> Self {
+        self.wasi_stdout = mode;
+        self
+    }
+
+    /// WASI 标准错误模式
+    pub fn wasi_stderr(mut self, mode: WasiStdio) -> Self {
+        self.wasi_stderr = mode;
+        self
+    }
+
+    /// 追加一条 WASI 环境变量（可重复调用）
+    pub fn wasi_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.wasi_env.push((key.into(), value.into()));
+        self
+    }
+
+    /// 设置 WASI 命令行参数
+    pub fn wasi_args(mut self, args: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        self.wasi_args = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+        self
+    }
+
+    /// 追加一条 WASI 预打开目录（可重复调用）。宿主目录不可用/无权限 → 配置阶段报错终止。
+    pub fn wasi_preopen(
+        mut self,
+        host_path: impl Into<PathBuf>,
+        guest_path: impl Into<String>,
+        read: bool,
+        write: bool,
+    ) -> Self {
+        self.wasi_preopens
+            .push(WasiPreopen::new(host_path, guest_path, read, write));
+        self
     }
 
     /// 追加一条“只读某路径”规则（可重复调用）

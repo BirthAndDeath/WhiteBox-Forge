@@ -122,7 +122,7 @@ pub fn init() -> anyhow::Result<()> {
 }
 /// worker 协议帧 1 的载荷：wasm 按文件路径传输，还是整段字节传输。
 /// 字节路径无需落盘、也不依赖文件系统授权（默认封闭文件系统下也能跑）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum WasmSource {
     Path(PathBuf),
     Bytes(Vec<u8>),
@@ -139,27 +139,32 @@ fn run_worker() -> Result<(), WorkerError> {
     let input: Vec<u8> =
         postcard::from_bytes(&input_bytes).map_err(|e| WorkerError::new(WorkerExit::Decode, e))?;
     let config_bytes = read_bytes(&mut stdin).map_err(|e| WorkerError::new(WorkerExit::Io, e))?;
-    if !config_bytes.is_empty() {
-        //父进程传入的沙箱参数 → 全局配置
+    // 帧 3 缺失时用默认（全关闭）；损坏时 fail-closed。
+    // 本地保留一份显式传给 run_wasm/build_store，避免依赖进程级全局配置。
+    let wasi_config = if config_bytes.is_empty() {
+        sandbox_config()
+    } else {
         match postcard::from_bytes::<SandboxConfig>(&config_bytes) {
             Ok(config) => {
-                let _ = set_sandbox_config(config);
+                // 全局配置仅用于 apply_sandbox（L1 进程沙箱）
+                let _ = set_sandbox_config(config.clone());
+                config
             }
             Err(e) => {
                 // 配置损坏：fail-closed，拒绝运行（不落到默认配置）
                 return Err(WorkerError::new(WorkerExit::Decode, e));
             }
         }
-    }
+    };
     //先应用全局进程沙箱配置，不支持的配置项会打进 stderr 供审计
     apply_sandbox();
     //connect channel
-    run_wasm(source, &input)
+    run_wasm(source, &input, &wasi_config)
 }
 
-/// 应用全局沙箱配置并输出不支持项的警告
-fn apply_sandbox() {
-    for item in setup_sandbox() {
+/// 应用沙箱配置（L1，尽力而为：失败只报告不中止）并输出不支持项的警告
+fn apply_sandbox_with(cfg: &SandboxConfig) {
+    for item in setup_sandbox_with(cfg) {
         if item.status == ApplyStatus::Error {
             eprintln!(
                 "[whitebox] sandbox capability '{}' is not supported on this platform",
@@ -168,8 +173,13 @@ fn apply_sandbox() {
         }
     }
 }
+
+/// 应用全局沙箱配置（worker 分支）
+fn apply_sandbox() {
+    apply_sandbox_with(&sandbox_config());
+}
 //阻塞运行
-fn run_wasm(source: WasmSource, input: &Vec<u8>) -> Result<(), WorkerError> {
+fn run_wasm(source: WasmSource, _input: &Vec<u8>, cfg: &SandboxConfig) -> Result<(), WorkerError> {
     let module = match source {
         // 路径来源需要父进程在 spawn 前显式授权读取（默认全关闭文件系统）
         WasmSource::Path(path) => {
@@ -180,7 +190,7 @@ fn run_wasm(source: WasmSource, input: &Vec<u8>) -> Result<(), WorkerError> {
             Module::new(&ENGINE, bytes).map_err(|e| WorkerError::new(WorkerExit::Load, e))?
         }
     };
-    let sandbox = load_module_for_worker(module, Arc::new(AtomicBool::new(false)))
+    let sandbox = load_module_for_worker(module, Arc::new(AtomicBool::new(false)), cfg)
         .map_err(|e| WorkerError::new(WorkerExit::Instantiate, e))?; //后面的flag在此处是无用的
     SandboxHandle::run_module_for_worker(sandbox)
         .map_err(|e| WorkerError::new(WorkerExit::Run, e))?;
@@ -208,6 +218,7 @@ pub struct WasmSandbox<T: 'static> {
     store: Store<T>,
 }
 // 签名/内容校验的占位结构，后续接入
+#[allow(dead_code)] // 签名/内容校验的占位结构，后续接入
 pub struct WasmMetadata {
     pubkey: Option<Vec<u8>>,
     signature: Option<Vec<u8>>,
@@ -291,20 +302,89 @@ fn build_linker(async_wasi: bool) -> Result<Linker<HostState>, wasmtime::Error> 
     Ok(linker)
 }
 
-/// 构建 Store（worker / thread 共用）：WASI 默认继承 stdio，注入 shutdown flag。
-/// 后续可按 SandboxConfig::fs_rules 预打开文件系统（preopen）。
-fn build_store(shutdown_flag: Arc<AtomicBool>) -> Store<HostState> {
-    let wasi_ctx = wasmtime_wasi::WasiCtxBuilder::new()
-        .inherit_stdio()
-        .build_p1();
-    Store::new(
+/// 构建 Store（worker / thread 共用）：按调用方**显式传入**的 `SandboxConfig` WASI 段配置
+/// guest 视野（不读进程级全局，避免多实例配置互相污染）。
+/// WASI 是 L2：**配置失败必须报错终止**（如 preopen 目录打不开），由调用方冒泡成错误。
+fn build_store(
+    shutdown_flag: Arc<AtomicBool>,
+    cfg: &SandboxConfig,
+) -> Result<Store<HostState>, wasmtime::Error> {
+    let mut builder = wasmtime_wasi::WasiCtxBuilder::new();
+
+    use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+    match cfg.wasi_stdin {
+        WasiStdio::Inherit => {
+            builder.inherit_stdin();
+        }
+        WasiStdio::Capture => {
+            builder.stdin(MemoryInputPipe::new(Vec::<u8>::new()));
+        }
+        WasiStdio::Null => {
+            builder.stdin(std::io::empty());
+        }
+    }
+    match cfg.wasi_stdout {
+        WasiStdio::Inherit => {
+            builder.inherit_stdout();
+        }
+        WasiStdio::Capture => {
+            builder.stdout(MemoryOutputPipe::new(1 << 20));
+        }
+        WasiStdio::Null => {
+            builder.stdout(std::io::empty());
+        }
+    }
+    match cfg.wasi_stderr {
+        WasiStdio::Inherit => {
+            builder.inherit_stderr();
+        }
+        WasiStdio::Capture => {
+            builder.stderr(MemoryOutputPipe::new(1 << 20));
+        }
+        WasiStdio::Null => {
+            builder.stderr(std::io::empty());
+        }
+    }
+
+    for (key, value) in &cfg.wasi_env {
+        builder.env(key, value);
+    }
+    if !cfg.wasi_args.is_empty() {
+        builder.args(&cfg.wasi_args);
+    }
+    for preopen in &cfg.wasi_preopens {
+        let mut dir_perms = wasmtime_wasi::DirPerms::READ;
+        let mut file_perms = wasmtime_wasi::FilePerms::READ;
+        if preopen.write {
+            dir_perms |= wasmtime_wasi::DirPerms::MUTATE;
+            file_perms |= wasmtime_wasi::FilePerms::WRITE;
+        }
+        // 配置失败（目录不可开/权限不足）→ 直接报错终止（L2 fail-closed）
+        builder
+            .preopened_dir(
+                &preopen.host_path,
+                &preopen.guest_path,
+                dir_perms,
+                file_perms,
+            )
+            .map_err(|e| {
+                wasmtime::Error::msg(format!(
+                    "wasi preopen '{}' -> '{}' failed: {e}",
+                    preopen.host_path.display(),
+                    preopen.guest_path
+                ))
+            })?;
+    }
+
+    let wasi_ctx = builder.build_p1();
+    Ok(Store::new(
         &ENGINE,
         HostState {
             wasi: wasi_ctx,
             marker: 4,
             shutdown_requested_only_for_threadfallback: shutdown_flag,
         },
-    )
+    ))
 }
 
 /// worker（进程）用加载：同步 linker + 同步 instantiate。
@@ -312,9 +392,10 @@ fn build_store(shutdown_flag: Arc<AtomicBool>) -> Store<HostState> {
 pub fn load_module_for_worker(
     module: Module,
     shutdown_flag: Arc<AtomicBool>,
+    cfg: &SandboxConfig,
 ) -> Result<WasmSandbox<HostState>, wasmtime::Error> {
     let linker = build_linker(false)?;
-    let mut store = build_store(shutdown_flag);
+    let mut store = build_store(shutdown_flag, cfg)?;
     let instance = linker.instantiate(&mut store, &module)?;
     Ok(WasmSandbox::new(instance, store))
 }
@@ -324,9 +405,10 @@ pub fn load_module_for_worker(
 pub async fn load_module_for_thread(
     module: Module,
     shutdown_flag: Arc<AtomicBool>,
+    cfg: &SandboxConfig,
 ) -> Result<WasmSandbox<HostState>, wasmtime::Error> {
     let linker = build_linker(true)?;
-    let mut store = build_store(shutdown_flag);
+    let mut store = build_store(shutdown_flag, cfg)?;
     // epoch 打断：必须在 instantiate_async 之前设置，否则默认 deadline=0（恒已过期）会 Trap::Interrupt
     store.set_epoch_deadline(1);
     store.epoch_deadline_callback(SandboxHandle::epoch_callback);
@@ -483,9 +565,8 @@ impl SandboxHandle {
                 let shutdown_flag_clone = shutdown_flag_for_thread.clone();
                 let (tx, rx) = watch::channel(ThreadCommand::Empty); //信号
                 let thread = std::thread::spawn(move || -> Result<()> {
-                    //线程模式没有任何进程隔离，仅尽力应用沙箱限制
-                    let _ = set_sandbox_config(config);
-                    apply_sandbox();
+                    //线程模式没有任何进程隔离，仅尽力应用沙箱限制（显式传本次配置，不写全局）
+                    apply_sandbox_with(&config);
                     // 加载与运行在同一个 current-thread runtime 内闭环，避免嵌套 runtime panic
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -495,7 +576,7 @@ impl SandboxHandle {
                             WasmSource::Path(path) => load_from_wasm_file(&path)?,
                             WasmSource::Bytes(bytes) => Module::new(&ENGINE, bytes)?,
                         };
-                        let sandbox = load_module_for_thread(module, shutdown_flag_clone).await?;
+                        let sandbox = load_module_for_thread(module, shutdown_flag_clone, &config).await?;
                         Self::run_module_for_thread(sandbox, rx).await
                     });
                     result?; //传播错误
