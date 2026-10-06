@@ -59,7 +59,8 @@ jobs:
           cargo clippy --workspace --all-targets --message-format=json -- -D warnings | tee clippy-results.json | clippy-sarif > clippy-results.sarif
 
       - name: Upload analysis results to GitHub
-        if: always()
+        # 仅当 clippy 真正产出了 SARIF 才上传（fmt 失败致 clippy 被跳过时文件不存在）
+        if: always() && hashFiles('clippy-results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: clippy-results.sarif

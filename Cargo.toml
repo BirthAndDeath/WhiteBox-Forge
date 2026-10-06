@@ -1,3 +1,7 @@
+[workspace]
+members = ["whitebox_core"]
+resolver = "3"
+
 [package]
 name = "whitebox-forge"
 version = "0.1.0"

@@ -22,7 +22,7 @@ fn get_engine_config() -> wasmtime::Config {
         .load(Ordering::SeqCst)
     {
         //在worker模式中，则已进入进程，无需线程回退的异步协作模式，因为异步协作有性能损耗
-        return config;
+        config
     } else {
         config.wasm_component_model_async(true);
         //config.consume_fuel(true);
@@ -33,7 +33,7 @@ fn get_engine_config() -> wasmtime::Config {
         config
     }
 }
-///！用于确定全局状态，因此必须在一切core函数运行前运行！！喵！MIAO!
+//！用于确定全局状态，因此必须在一切core函数运行前运行！！喵！MIAO!
 
 /// worker 进程失败退出的阶段码。父进程通过 `wait()/try_wait()` 的退出码区分失败阶段。
 #[repr(i32)]
@@ -353,20 +353,14 @@ fn build_store(
         builder.args(&cfg.wasi_args);
     }
     for preopen in &cfg.wasi_preopens {
-        let mut dir_perms = wasmtime_wasi::DirPerms::READ;
-        let mut file_perms = wasmtime_wasi::FilePerms::READ;
-        if preopen.write {
-            dir_perms |= wasmtime_wasi::DirPerms::MUTATE;
-            file_perms |= wasmtime_wasi::FilePerms::WRITE;
-        }
+        let perms = if preopen.write {
+            wasmtime_wasi::FsPerms::ReadWrite
+        } else {
+            wasmtime_wasi::FsPerms::ReadOnly
+        };
         // 配置失败（目录不可开/权限不足）→ 直接报错终止（L2 fail-closed）
         builder
-            .preopened_dir(
-                &preopen.host_path,
-                &preopen.guest_path,
-                dir_perms,
-                file_perms,
-            )
+            .preopened_dir(&preopen.host_path, &preopen.guest_path, perms)
             .map_err(|e| {
                 wasmtime::Error::msg(format!(
                     "wasi preopen '{}' -> '{}' failed: {e}",
@@ -576,7 +570,8 @@ impl SandboxHandle {
                             WasmSource::Path(path) => load_from_wasm_file(&path)?,
                             WasmSource::Bytes(bytes) => Module::new(&ENGINE, bytes)?,
                         };
-                        let sandbox = load_module_for_thread(module, shutdown_flag_clone, &config).await?;
+                        let sandbox =
+                            load_module_for_thread(module, shutdown_flag_clone, &config).await?;
                         Self::run_module_for_thread(sandbox, rx).await
                     });
                     result?; //传播错误

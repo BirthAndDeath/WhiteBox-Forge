@@ -11,13 +11,13 @@
 //! ## 如何新增一项沙箱能力（维护清单）
 //!
 //! 1. 在 [`SandboxCapability`] 增加一个变体，并在 [`SandboxCapability::ALL`] 尾部追加。
-//!    2. 在 [`SandboxCapability::as_str`] 增加人类可读名。
-//!    3. 在 [`SandboxConfig`] 增加对应字段。
-//!    4. 在 [`SandboxConfig::is_requested`] 登记“如何判断该项被请求”。
-//!    5. 如与既有选项互斥，在 [`SandboxConfig::validate`] 增加断言。
-//!    6. 各平台在 `setup` 里用 [`ReportSet::override_status`] 覆盖其能实现的能力；
-//!       无法实现的能力自动保持“不支持 → Error”，无需编写。
-//!    7. 在 `whitebox_core/tests/sandbox.rs` 增加覆盖测试。
+//! 2. 在 [`SandboxCapability::as_str`] 增加人类可读名。
+//! 3. 在 [`SandboxConfig`] 增加对应字段。
+//! 4. 在 [`SandboxConfig::is_requested`] 登记“如何判断该项被请求”。
+//! 5. 如与既有选项互斥，在 [`SandboxConfig::validate`] 增加断言。
+//! 6. 各平台在 `setup` 里用 [`ReportSet::override_status`] 覆盖其能实现的能力；
+//!    无法实现的能力自动保持“不支持 → Error”，无需编写。
+//! 7. 在 `whitebox_core/tests/sandbox.rs` 增加覆盖测试。
 //!
 //! 所有宏 / cfg 均按平台互斥编译（一个目标系统只会启用一份 `setup`），
 //! `libc` 常量与 `setrlimit` 等在调用点直接配对，杜绝跨平台类型冲突。

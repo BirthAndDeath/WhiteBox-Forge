@@ -35,11 +35,11 @@
 7. **集成测试递归风险**：测试进程的 `current_exe()` 是测试二进制，`run`/`run_data` spawn 它会递归跑测试；`try.rs` 靠 `WHITEBOX_FORCE_THREAD_FALLBACK`（仅 `#[cfg(debug_assertions)]`）强制线程回退。
 8. **非 UTF-8 路径**：原 `to_string_lossy` + `read_string` 失真；改 `WasmSource` postcard 序列化后无损。
 
-## WASI 配置细节 / WASI Options（wasmtime-wasi 47，p1/p2 均为默认特性）
+## WASI 配置细节 / WASI Options（wasmtime-wasi 48，p1/p2 均为默认特性）
 
 - `WasiStdio::{Inherit, Capture, Null}` → builder：`inherit_*` / `MemoryInputPipe/MemoryOutputPipe`（p2 pipe，Capture 检索尚未接线）/ `std::io::empty()`。
-- `wasi_preopens` → `preopened_dir(&host, &guest, DirPerms::READ[|MUTATE], FilePerms::READ[|WRITE])`，打开失败即报错（L2 fail-closed）。
-- 权限面 `DirPerms`/`FilePerms` 位集在 `wasmtime_wasi` 根部；`StdinStream/StdoutStream` 实现：`std::io::Stdin/Stdout/Stderr/Empty`、`p2::pipe::Memory*`。
+- `wasi_preopens` → `preopened_dir(&host, &guest, FsPerms::{ReadOnly|ReadWrite})`，打开失败即报错（L2 fail-closed）。
+- 权限面 `FsPerms`（48 起由 `DirPerms`/`FilePerms` 合并而来）在 `wasmtime_wasi` 根部；`StdinStream/StdoutStream` 实现：`std::io::Stdin/Stdout/Stderr/Empty`、`p2::pipe::Memory*`。
 - sockets：WASI p1 无；p2 有但本项目未接。
 
 ## 已知缺口（详见 TODO.md）

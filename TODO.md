@@ -51,7 +51,7 @@
 |---|---|---|---|---|
 | stdio | `WasiStdio::{Inherit, Capture, Null}`（已有） | `inherit_*/Memory*Pipe/io::empty()` | ✅ | ✅ |
 | env/args | 显式白名单 Vec（已有） | `env()/args()` | ✅ | ✅ |
-| preopens | `WasiPreopen{host,guest,read,write}`（已有） | `preopened_dir(DirPerms/FilePerms)` | ✅ | ✅ |
+| preopens | `WasiPreopen{host,guest,read,write}`（已有） | `preopened_dir(FsPerms::{ReadOnly,ReadWrite})` | ✅ | ✅ |
 | **sockets**（新） | `WasiSockets::{None, Allow(Vec<PortRange>), Deny(..), LoopbackOnly}` | `socket_addr_check(SocketAddr, SocketAddrUse)` | ❌ 配置即报错 | ✅ |
 | **clocks**（新） | `WasiClocks::{Host, Deterministic(seed)}` | `builder.clocks()` | ✅ | ✅ |
 | **random**（新） | `WasiRandom::{Os, Seeded(u128)}` | `secure_random/insecure_random(_seed)` | ✅ | ✅ |

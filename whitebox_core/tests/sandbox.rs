@@ -42,36 +42,41 @@ fn grants_compose_over_locked_default() {
 
 #[test]
 fn validate_detects_sealed_with_fs_root() {
-    let mut cfg = SandboxConfig::default(); // sealed = true
-    cfg.fs_root = Some(PathBuf::from("/srv/sandbox"));
+    // 默认 sealed=true；再设 fs_root 即冲突
+    let cfg = SandboxConfig::default().fs_root("/srv/sandbox");
     assert!(!cfg.validate().is_empty());
 }
 
 #[test]
 fn validate_detects_fs_root_with_temp_write() {
-    let mut cfg = SandboxConfig::default();
-    cfg.fs_root = Some(PathBuf::from("/srv/sandbox"));
-    cfg.temp_allow_write = true;
+    let cfg = SandboxConfig::default()
+        .fs_root("/srv/sandbox")
+        .temp_allow_write(true);
     assert!(!cfg.validate().is_empty());
 }
 
 #[test]
 fn validate_detects_anti_debug_and_core_conflict() {
-    let mut cfg = SandboxConfig::default();
-    cfg.anti_debug = true;
-    cfg.max_core_bytes = Some(1024 * 1024);
-    assert!(!cfg.validate().is_empty());
-
+    // 默认 anti_debug=true；设非 0 core 上限即冲突
+    assert!(
+        !SandboxConfig::default()
+            .max_core_size(1024 * 1024)
+            .validate()
+            .is_empty()
+    );
     // 0 视为关闭 core dump，与 anti_debug 一致，合法
-    cfg.max_core_bytes = Some(0);
-    assert!(cfg.validate().is_empty());
+    assert!(
+        SandboxConfig::default()
+            .max_core_size(0)
+            .validate()
+            .is_empty()
+    );
 }
 
 #[test]
 fn validate_detects_deny_exec_and_children_conflict() {
-    let mut cfg = SandboxConfig::default();
-    cfg.deny_exec = true;
-    cfg.max_children = Some(2);
+    // 默认 deny_exec=true；再设 max_children 即冲突
+    let cfg = SandboxConfig::default().max_children(2);
     assert!(!cfg.validate().is_empty());
 }
 
