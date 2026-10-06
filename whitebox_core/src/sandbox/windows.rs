@@ -1,4 +1,4 @@
-﻿//! Windows 平台进程沙箱实现。
+//! Windows 平台进程沙箱实现。
 //!
 //! 应用机制（全部无需管理员权限）：
 //! - no_new_privileges：Job 对象安全限制（`JOB_OBJECT_SECURITY_NO_ADMIN`）
@@ -19,9 +19,10 @@ use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_TIME,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, ProcessSignaturePolicy, ProcessStrictHandleCheckPolicy,
@@ -32,7 +33,7 @@ use super::SandboxCapability::{
     MaxChildren, MaxCpuTime, MaxMemory, MsSignedOnly, NoExec, NoNewPrivileges, NoWin32k,
     StrictHandles,
 };
-use super::{outcome, CapabilityReport, ReportSet, SandboxConfig};
+use super::{CapabilityReport, ReportSet, SandboxConfig, outcome};
 
 // JobObjectSecurityLimitInformation = 6（Win8+ 的未文档化信息类，windows-sys 未导出）
 const JOBOBJECT_INFO_SECURITY_LIMITS: i32 = 6;
@@ -68,7 +69,10 @@ pub(super) fn setup(config: &SandboxConfig) -> Vec<CapabilityReport> {
     let mut set = ReportSet::from_config(config);
     set.override_status(
         NoExec,
-        outcome(config.deny_exec, job.as_ref().is_some_and(|j| j.active_process_limit)),
+        outcome(
+            config.deny_exec,
+            job.as_ref().is_some_and(|j| j.active_process_limit),
+        ),
     )
     .override_status(
         MaxChildren,
@@ -102,7 +106,10 @@ pub(super) fn setup(config: &SandboxConfig) -> Vec<CapabilityReport> {
         NoWin32k,
         outcome(
             config.block_win32k,
-            mitigation(ProcessSystemCallDisablePolicy, MITIGATION_DISALLOW_WIN32K_SYSTEM_CALLS),
+            mitigation(
+                ProcessSystemCallDisablePolicy,
+                MITIGATION_DISALLOW_WIN32K_SYSTEM_CALLS,
+            ),
         ),
     )
     .override_status(

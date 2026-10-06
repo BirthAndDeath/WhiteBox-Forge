@@ -300,13 +300,28 @@ pub fn strict_syscalls() -> bool {
         const BPF_RET_K: u16 = 0x06; // BPF_RET(0x06) | BPF_K(0x00)
 
         fn ld_abs(offset: u8) -> SockFilter {
-            SockFilter { code: BPF_LD_ABS_W, jt: 0, jf: 0, k: offset as u32 }
+            SockFilter {
+                code: BPF_LD_ABS_W,
+                jt: 0,
+                jf: 0,
+                k: offset as u32,
+            }
         }
         fn jeq(k: u32, jt: u8, jf: u8) -> SockFilter {
-            SockFilter { code: BPF_JMP_JEQ_K, jt, jf, k }
+            SockFilter {
+                code: BPF_JMP_JEQ_K,
+                jt,
+                jf,
+                k,
+            }
         }
         fn ret(k: u32) -> SockFilter {
-            SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k }
+            SockFilter {
+                code: BPF_RET_K,
+                jt: 0,
+                jf: 0,
+                k,
+            }
         }
 
         let mut prog = Vec::with_capacity(DENIED.len() * 2 + 3);

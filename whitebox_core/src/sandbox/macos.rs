@@ -17,7 +17,7 @@ use super::SandboxCapability::{
     MaxFileSize, MaxOpenFiles, Network, NetworkPorts, NoExec, ReadonlyFileSystem, TempWrite,
 };
 use super::unix_common;
-use super::{outcome, CapabilityReport, NetworkPorts as NetPorts, ReportSet, SandboxConfig};
+use super::{CapabilityReport, NetworkPorts as NetPorts, ReportSet, SandboxConfig, outcome};
 
 /// libc 0.2.189 未导出 sandbox_init / sandbox_free_error，这里手动声明。
 /// 符号来自 libSystem，任何 macOS 程序都链接得到。
@@ -56,14 +56,20 @@ pub(super) fn setup(config: &SandboxConfig) -> Vec<CapabilityReport> {
     let mut set = ReportSet::from_config(config);
     set.override_status(FileAccess, outcome(!config.fs_rules.is_empty(), fs_applied))
         .override_status(ReadonlyFileSystem, outcome(config.readonly_fs, fs_applied))
-        .override_status(FilesystemSealed, outcome(config.deny_file_access, fs_applied))
+        .override_status(
+            FilesystemSealed,
+            outcome(config.deny_file_access, fs_applied),
+        )
         .override_status(TempWrite, outcome(config.temp_allow_write, fs_applied))
         .override_status(Network, outcome(config.deny_network, network_applied))
         .override_status(
             NetworkPorts,
             outcome(config.network_ports.is_requested(), network_applied),
         )
-        .override_status(LoopbackOnly, outcome(config.localhost_only, network_applied))
+        .override_status(
+            LoopbackOnly,
+            outcome(config.localhost_only, network_applied),
+        )
         .override_status(DnsOnly, outcome(config.dns_only, network_applied))
         .override_status(NoExec, outcome(config.deny_exec, fs_applied))
         .override_status(AntiDebug, outcome(config.anti_debug, anti_debug_applied))
@@ -71,7 +77,9 @@ pub(super) fn setup(config: &SandboxConfig) -> Vec<CapabilityReport> {
             MaxOpenFiles,
             outcome(
                 config.max_open_files.is_some(),
-                config.max_open_files.is_some_and(unix_common::limit_open_files),
+                config
+                    .max_open_files
+                    .is_some_and(unix_common::limit_open_files),
             ),
         )
         .override_status(
@@ -85,14 +93,18 @@ pub(super) fn setup(config: &SandboxConfig) -> Vec<CapabilityReport> {
             MaxFileSize,
             outcome(
                 config.max_file_size_bytes.is_some(),
-                config.max_file_size_bytes.is_some_and(unix_common::limit_file_size),
+                config
+                    .max_file_size_bytes
+                    .is_some_and(unix_common::limit_file_size),
             ),
         )
         .override_status(
             MaxCoreSize,
             outcome(
                 config.max_core_bytes.is_some(),
-                config.max_core_bytes.is_some_and(unix_common::limit_core_bytes),
+                config
+                    .max_core_bytes
+                    .is_some_and(unix_common::limit_core_bytes),
             ),
         );
     set.finish()
@@ -114,10 +126,7 @@ fn ptrace_deny_attach() -> bool {
 /// 因此先 `(deny network*)` 封死全局网络，再用带端口/地址谓词的 allow 定向放行。
 /// 端口段语法：`(allow network-outbound (remote tcp (remote-port a) (remote-port b)))`。
 fn apply_network_profile(config: &SandboxConfig) -> bool {
-    let mut rules = vec![
-        String::from("(version 1)"),
-        String::from("(allow default)"),
-    ];
+    let mut rules = vec![String::from("(version 1)"), String::from("(allow default)")];
 
     match &config.network_ports {
         NetPorts::Allow(ranges) => {
@@ -150,9 +159,7 @@ fn apply_network_profile(config: &SandboxConfig) -> bool {
         rules.push(String::from(
             "(allow network-outbound (local-ip 127.0.0.1))",
         ));
-        rules.push(String::from(
-            "(allow network-inbound (local-ip 127.0.0.1))",
-        ));
+        rules.push(String::from("(allow network-inbound (local-ip 127.0.0.1))"));
     }
     if config.dns_only {
         rules.push(String::from("(deny network*)"));
@@ -172,10 +179,7 @@ fn apply_network_profile(config: &SandboxConfig) -> bool {
 
 /// 文件 profile：sealed / 路径授权都默认拒绝，再按授权规则逐条放行（deny-by-default + 显式 grant）。
 fn apply_fs_profile(config: &SandboxConfig) -> bool {
-    let mut rules = vec![
-        String::from("(version 1)"),
-        String::from("(allow default)"),
-    ];
+    let mut rules = vec![String::from("(version 1)"), String::from("(allow default)")];
 
     let has_path_rules = !config.fs_rules.is_empty();
     // 封闭基线：sealed 或存在路径授权时，默认拒绝全部文件访问

@@ -22,7 +22,7 @@ use super::SandboxCapability::{
     MaxOpenFiles, Network, NoExec, NoNewPrivileges, ReadonlyFileSystem, StrictSyscalls, TempWrite,
 };
 use super::unix_common;
-use super::{outcome, CapabilityReport, ReportSet, SandboxConfig};
+use super::{CapabilityReport, ReportSet, SandboxConfig, outcome};
 
 pub(super) fn setup(config: &SandboxConfig) -> Vec<CapabilityReport> {
     // fs_root：先做不可逆的 chroot（必须在 Landlock / seccomp 之前，否则该路径/syscall 已被封死）
@@ -76,47 +76,68 @@ pub(super) fn setup(config: &SandboxConfig) -> Vec<CapabilityReport> {
     let strict_applied = false;
 
     let mut set = ReportSet::from_config(config);
-    set.override_status(FileAccess, outcome(!config.fs_rules.is_empty(), fs_restricted))
-        .override_status(ReadonlyFileSystem, outcome(config.readonly_fs, fs_restricted))
-        .override_status(FilesystemSealed, outcome(config.deny_file_access, fs_restricted))
-        .override_status(FilesystemRoot, outcome(config.fs_root.is_some(), fs_root_applied))
-        .override_status(TempWrite, outcome(config.temp_allow_write, fs_restricted))
-        .override_status(Network, outcome(config.deny_network, network_applied))
-        .override_status(NoExec, outcome(config.deny_exec, fs_restricted))
-        .override_status(
-            NoNewPrivileges,
-            outcome(config.no_new_privileges, no_new_priv_applied),
-        )
-        .override_status(AntiDebug, outcome(config.anti_debug, anti_debug_applied))
-        .override_status(
-            MaxOpenFiles,
-            outcome(
-                config.max_open_files.is_some(),
-                config.max_open_files.is_some_and(unix_common::limit_open_files),
-            ),
-        )
-        .override_status(
-            MaxCpuTime,
-            outcome(
-                config.max_cpu_ms.is_some(),
-                config.max_cpu_ms.is_some_and(unix_common::limit_cpu_ms),
-            ),
-        )
-        .override_status(
-            MaxFileSize,
-            outcome(
-                config.max_file_size_bytes.is_some(),
-                config.max_file_size_bytes.is_some_and(unix_common::limit_file_size),
-            ),
-        )
-        .override_status(
-            MaxCoreSize,
-            outcome(
-                config.max_core_bytes.is_some(),
-                config.max_core_bytes.is_some_and(unix_common::limit_core_bytes),
-            ),
-        )
-        .override_status(StrictSyscalls, outcome(config.strict_syscalls, strict_applied));
+    set.override_status(
+        FileAccess,
+        outcome(!config.fs_rules.is_empty(), fs_restricted),
+    )
+    .override_status(
+        ReadonlyFileSystem,
+        outcome(config.readonly_fs, fs_restricted),
+    )
+    .override_status(
+        FilesystemSealed,
+        outcome(config.deny_file_access, fs_restricted),
+    )
+    .override_status(
+        FilesystemRoot,
+        outcome(config.fs_root.is_some(), fs_root_applied),
+    )
+    .override_status(TempWrite, outcome(config.temp_allow_write, fs_restricted))
+    .override_status(Network, outcome(config.deny_network, network_applied))
+    .override_status(NoExec, outcome(config.deny_exec, fs_restricted))
+    .override_status(
+        NoNewPrivileges,
+        outcome(config.no_new_privileges, no_new_priv_applied),
+    )
+    .override_status(AntiDebug, outcome(config.anti_debug, anti_debug_applied))
+    .override_status(
+        MaxOpenFiles,
+        outcome(
+            config.max_open_files.is_some(),
+            config
+                .max_open_files
+                .is_some_and(unix_common::limit_open_files),
+        ),
+    )
+    .override_status(
+        MaxCpuTime,
+        outcome(
+            config.max_cpu_ms.is_some(),
+            config.max_cpu_ms.is_some_and(unix_common::limit_cpu_ms),
+        ),
+    )
+    .override_status(
+        MaxFileSize,
+        outcome(
+            config.max_file_size_bytes.is_some(),
+            config
+                .max_file_size_bytes
+                .is_some_and(unix_common::limit_file_size),
+        ),
+    )
+    .override_status(
+        MaxCoreSize,
+        outcome(
+            config.max_core_bytes.is_some(),
+            config
+                .max_core_bytes
+                .is_some_and(unix_common::limit_core_bytes),
+        ),
+    )
+    .override_status(
+        StrictSyscalls,
+        outcome(config.strict_syscalls, strict_applied),
+    );
     set.finish()
 }
 

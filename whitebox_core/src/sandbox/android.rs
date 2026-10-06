@@ -11,7 +11,7 @@ use super::SandboxCapability::{
     StrictSyscalls,
 };
 use super::unix_common;
-use super::{outcome, CapabilityReport, ReportSet, SandboxConfig};
+use super::{CapabilityReport, ReportSet, SandboxConfig, outcome};
 
 pub(super) fn setup(config: &SandboxConfig) -> Vec<CapabilityReport> {
     // 副作用调用按配置项门控（Rust 会先求值实参，不能把副作用调用塞进 outcome(...) 实参）
@@ -50,7 +50,9 @@ pub(super) fn setup(config: &SandboxConfig) -> Vec<CapabilityReport> {
             MaxOpenFiles,
             outcome(
                 config.max_open_files.is_some(),
-                config.max_open_files.is_some_and(unix_common::limit_open_files),
+                config
+                    .max_open_files
+                    .is_some_and(unix_common::limit_open_files),
             ),
         )
         .override_status(
@@ -64,16 +66,23 @@ pub(super) fn setup(config: &SandboxConfig) -> Vec<CapabilityReport> {
             MaxFileSize,
             outcome(
                 config.max_file_size_bytes.is_some(),
-                config.max_file_size_bytes.is_some_and(unix_common::limit_file_size),
+                config
+                    .max_file_size_bytes
+                    .is_some_and(unix_common::limit_file_size),
             ),
         )
         .override_status(
             MaxCoreSize,
             outcome(
                 config.max_core_bytes.is_some(),
-                config.max_core_bytes.is_some_and(unix_common::limit_core_bytes),
+                config
+                    .max_core_bytes
+                    .is_some_and(unix_common::limit_core_bytes),
             ),
         )
-        .override_status(StrictSyscalls, outcome(config.strict_syscalls, strict_applied));
+        .override_status(
+            StrictSyscalls,
+            outcome(config.strict_syscalls, strict_applied),
+        );
     set.finish()
 }
