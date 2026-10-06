@@ -151,7 +151,7 @@ pub fn landlock(
     }
 
     // 添加一条 path_beneath 规则；失败即整体放弃
-    let mut add_rule = |parent_fd: i32, allowed: u64| -> bool {
+    let add_rule = |parent_fd: i32, allowed: u64| -> bool {
         let beneath = LandlockPathBeneathAttr {
             allowed_access: allowed,
             parent_fd,
@@ -177,7 +177,7 @@ pub fn landlock(
             if !deny_exec {
                 allowed |= LANDLOCK_ACCESS_FS_EXECUTE;
             }
-            let root = libc::open(c"/".as_ptr().cast(), libc::O_PATH);
+            let root = unsafe { libc::open(c"/".as_ptr(), libc::O_PATH) };
             let ok = root >= 0 && add_rule(root, allowed);
             if root >= 0 {
                 unsafe { libc::close(root) };
@@ -204,7 +204,7 @@ pub fn landlock(
             let Ok(c_path) = CString::new(rule.path.as_os_str().as_bytes()) else {
                 continue;
             };
-            let fd = libc::open(c_path.as_ptr().cast(), libc::O_PATH);
+            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH) };
             if fd < 0 {
                 continue; // 路径不存在或不可达：跳过（该条能力授予失败而非整体失败）
             }
@@ -220,7 +220,7 @@ pub fn landlock(
     // 临时目录写放行（sealed 基线上的显式 grant）
     if temp_allow_write && !readonly_fs {
         if let Ok(temp) = CString::new(std::env::temp_dir().as_os_str().as_bytes()) {
-            let fd = libc::open(temp.as_ptr().cast(), libc::O_PATH);
+            let fd = unsafe { libc::open(temp.as_ptr(), libc::O_PATH) };
             if fd >= 0 {
                 let ok = add_rule(fd, read_bits | write_bits);
                 unsafe { libc::close(fd) };

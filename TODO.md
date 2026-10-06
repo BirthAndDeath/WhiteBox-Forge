@@ -72,6 +72,7 @@
 
 ## P3 测试缺口
 
+- [ ] **CI 未覆盖 GUI crate**：ubuntu runner 缺 fontconfig 等系统库，clippy/test 仅跑 `whitebox_core`；可在 windows runner 上补 `whitebox-forge` 的 clippy/test。
 - [ ] **真机覆盖 Linux/macOS 沙箱（Landlock/seatbelt/seccomp）**
   - `whitebox_core/tests/sandbox.rs` 目前纯逻辑；平台实现 `sandbox/linux.rs`、`sandbox/macos.rs`、`sandbox/unix_common.rs`
 - [ ] **线程关闭端到端**：`SandboxHandle::shutdown()` → `increment_epoch()` → `epoch_callback` Err 打断 → join 返回。

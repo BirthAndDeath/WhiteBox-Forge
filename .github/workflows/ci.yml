@@ -30,7 +30,7 @@ jobs:
         run: cargo audit
 
   cargo-clippy:
-    name: cargo clippy (workspace, hard gate + SARIF)
+    name: cargo clippy (whitebox_core, hard gate + SARIF)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -49,11 +49,12 @@ jobs:
       - name: install clippy-sarif
         run: cargo install clippy-sarif sarif-fmt --locked
 
-      - name: clippy (workspace, hard gate + SARIF)
+      - name: clippy (whitebox_core, hard gate + SARIF)
+        # 排除 whitebox-forge（Slint GUI crate，ubuntu runner 缺 fontconfig 等系统库）。
         # set -o pipefail 保证 -D warnings 硬失败不被管道吞掉；tee 保存原始 JSON 供 SARIF 生成。
         run: |
           set -o pipefail
-          cargo clippy --workspace --all-targets --message-format=json -- -D warnings | tee clippy-results.json | clippy-sarif > clippy-results.sarif
+          cargo clippy -p whitebox_core --all-targets --message-format=json -- -D warnings | tee clippy-results.json | clippy-sarif > clippy-results.sarif
 
       - name: Upload analysis results to GitHub
         # 仅当 clippy 真正产出了 SARIF 才上传（clippy 被跳过时文件不存在）

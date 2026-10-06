@@ -34,6 +34,7 @@
 6. **`WasmSandbox` 不能存进 `SandboxHandle`**：运行期 store 归属子进程/执行闭包，父进程句柄拿不到活实例；死字段 `wasm_sandbox` 已删。要做进程内交互就用 `load_module_for_thread` + `call_func` 自己持有。
 7. **集成测试递归风险**：测试进程的 `current_exe()` 是测试二进制，`run`/`run_data` spawn 它会递归跑测试；`try.rs` 靠 `WHITEBOX_FORCE_THREAD_FALLBACK`（仅 `#[cfg(debug_assertions)]`）强制线程回退。
 8. **非 UTF-8 路径**：原 `to_string_lossy` + `read_string` 失真；改 `WasmSource` postcard 序列化后无损。
+9. **cfg 平台代码本地编不到**：`sandbox/unix_common.rs`（linux/android）、`linux.rs`、`macos.rs` 在 Windows 上被 `#[cfg]` 排除，**改这些文件后 Windows `cargo check` 不会报错**——曾漏包 `unsafe`（`libc::open`）与多余 `mut`，直到 CI（ubuntu）才暴露。教训：改 cfg(windows 之外) 的代码要额外自查（所有 `libc::` 函数调用必须 `unsafe`），或依赖 CI 验证；本地可尝试 `rustup target add <linux> && cargo check --target <linux>`（首次编译重，通常直接靠 CI）。
 
 ## WASI 配置细节 / WASI Options（wasmtime-wasi 48，p1/p2 均为默认特性）
 
