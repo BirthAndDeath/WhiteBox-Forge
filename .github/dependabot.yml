@@ -1,0 +1,43 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "rust"
+    # 分组更新：相关依赖合并进同一个 PR，减少噪音
+    groups:
+      wasmtime:
+        patterns:
+          - "wasmtime*"
+      slint:
+        patterns:
+          - "slint*"
+      tokio:
+        patterns:
+          - "tokio*"
+        update-types:
+          - "minor"
+          - "patch"
+      serialization:
+        patterns:
+          - "postcard"
+          - "serde*"
+      cli:
+        patterns:
+          - "clap*"
+    versioning-strategy: "auto"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+    labels:
+      - "ci"
