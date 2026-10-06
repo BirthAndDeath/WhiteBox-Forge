@@ -1,0 +1,82 @@
+warning: unused imports: `fs::read` and `num::NonZero`
+ --> whitebox_core\src\lib.rs:4:11
+  |
+4 | use std::{fs::read, num::NonZero, path::Path, sync::LazyLock};
+  |           ^^^^^^^^  ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `component::JoinHandle`
+ --> whitebox_core\src\lib.rs:5:16
+  |
+5 | use wasmtime::{component::JoinHandle, error::Ok, *};
+  |                ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `wasmtime_wasi::p2::bindings::io`
+ --> whitebox_core\src\lib.rs:6:5
+  |
+6 | use wasmtime_wasi::p2::bindings::io;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `platform::*`
+ --> whitebox_core\src\lib.rs:9:5
+  |
+9 | use platform::*;
+  |     ^^^^^^^^^^^
+
+warning: unused variable: `path`
+  --> whitebox_core\src\lib.rs:49:13
+   |
+49 | fn run_wasm(path: &String, input: &Vec<u8>) {}
+   |             ^^^^ help: if this is intentional, prefix it with an underscore: `_path`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `input`
+  --> whitebox_core\src\lib.rs:49:28
+   |
+49 | fn run_wasm(path: &String, input: &Vec<u8>) {}
+   |                            ^^^^^ help: if this is intentional, prefix it with an underscore: `_input`
+
+warning: unused variable: `e`
+   --> whitebox_core\src\lib.rs:142:20
+    |
+142 |         if let Err(e) = spawn_command_result {
+    |                    ^ help: if this is intentional, prefix it with an underscore: `_e`
+
+warning: unused variable: `cancel`
+   --> whitebox_core\src\lib.rs:143:17
+    |
+143 |             let cancel = Arc::new(AtomicBool::new(false));
+    |                 ^^^^^^ help: if this is intentional, prefix it with an underscore: `_cancel`
+
+warning: static `THREADPOOL` is never used
+  --> whitebox_core\src\lib.rs:24:8
+   |
+24 | static THREADPOOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+   |        ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `runner` is never read
+  --> whitebox_core\src\lib.rs:92:5
+   |
+91 | pub struct SandboxHandle {
+   |            ------------- field in this struct
+92 |     runner: Runner,
+   |     ^^^^^^
+
+error: failed to run custom build command for `whitebox-forge v0.1.0 (D:\Rust\WhiteBox-Forge)`
+
+Caused by:
+  process didn't exit successfully: `d:\Rust\WhiteBox-Forge\target\debug\build\whitebox-forge-91af17fa2ceff115\build-script-build` (exit code: 101)
+  --- stderr
+  error: Parse error
+   --> d:\Rust\WhiteBox-Forge\UI\ui.slint:7:10
+    |
+  7 |     const color WHITE: #ffffff;
+    |          ^
+
+  thread 'main' (15460) panicked at build.rs:2:41:
+  called `Result::unwrap()` on an `Err` value: CompileError(["d:\\Rust\\WhiteBox-Forge\\UI\\ui.slint:7: Parse error"])
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

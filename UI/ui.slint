@@ -3,28 +3,28 @@ import { Main } from "main.slint";
 import { Setting } from "setting.slint";
 import { Home } from "home.slint";
 import { Back } from "back.slint";
+import { clr } from "clr.slint";
 component letsgo inherits Rectangle {
     width: 1920px;
     height: 1080px;
-    background: #ffffff;
+    background: clr.bg;
     in-out property <int> page:0;
     Timer {
         interval: 3500ms;
-        running: true;
+        running: page == 0;
         triggered => {
-            page = 1;
+            if (page == 0) {
+                page = 1;
+            }
         }
     }
 
     if page == 0:Start { }
     Main {
-
+        background: clr.bg;
         opacity: page == 1 ? 1.0 : 0.0;
-        animate opacity { duration: 200ms; }
+        animate opacity { duration: clr.anim ? 200ms : 0ms; }
         appear: true;
-        back => {
-            root.page = 1;
-        }
         home => {
             root.page = 3;
         }
@@ -33,19 +33,24 @@ component letsgo inherits Rectangle {
         }
     }
 
-    Back {
-        opacity: page > 1 ? 1.0 : 0.0;
-        animate opacity { duration: 200ms; }
-    }
-
     Home {
+        background: clr.bg;
         opacity: page == 3 ? 1.0 : 0.0;
-        animate opacity { duration: 200ms; }
+        animate opacity { duration: clr.anim ? 200ms : 0ms; }
     }
 
     Setting {
         opacity: page == 2 ? 1.0 : 0.0;
-        animate opacity { duration: 200ms; }
+        animate opacity { duration: clr.anim ? 200ms : 0ms; }
+    }
+
+    Back {
+        z: 10;
+        opacity: page > 1 ? 1.0 : 0.0;
+        animate opacity { duration: clr.anim ? 200ms : 0ms; }
+        back => {
+            root.page = 1;
+        }
     }
 }
 

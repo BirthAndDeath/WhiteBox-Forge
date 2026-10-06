@@ -1,0 +1,23 @@
+export global clr {
+    in-out property <color> wht: white;
+    in-out property <color> blk: black;
+    in-out property <color> lssblk: #1a1a1a;
+    in-out property <color> lsswht: #f1f1f1;
+    in-out property <bool> chgthm: false;
+    in-out property <bool> anim: true;
+
+    in-out property <color> txt: clr.chgthm ? clr.wht : clr.blk;
+    in-out property <color> bg: clr.chgthm ? clr.blk : clr.wht;
+    in-out property <color> card: clr.chgthm ? clr.lssblk : clr.lsswht;
+    in-out property <color> on: clr.chgthm ? clr.blk : clr.wht;
+    in-out property <color> off: clr.chgthm ? clr.wht : clr.blk;
+    in-out property <color> sw: clr.anim ? #22c55e : clr.off;
+    in-out property <color> ad1: clr.chgthm ? #292929 : #e4e4e4;
+    in-out property <color> ad1b: clr.chgthm ? #4e4e4e : #cfcfcf;
+    in-out property <color> ad2: clr.chgthm ? #2d2d2d : #e7e7e7;
+    in-out property <color> ad2b: clr.chgthm ? #585858 : #d3d3d3;
+    in-out property <color> mini: clr.chgthm ? #2a2a2a : #eeeeee;
+    in-out property <color> minib: clr.chgthm ? #595959 : #d7d7d7;
+    in-out property <color> panel: clr.chgthm ? #191919 : #f3f3f3;
+    in-out property <color> panelb: clr.chgthm ? #3a3a3a : #d8d8d8;
+}
