@@ -11,6 +11,7 @@ permissions:
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.actor == 'dependabot[bot]'
     steps:
       - uses: dependabot/fetch-metadata@v2
@@ -32,9 +33,9 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # major：不自动合并，留提示触发人工迁移审查
+      # major：仅在 PR 首次打开时留言提示人工迁移（避免 sync/reopen/labeled 重复刷屏）
       - name: Prompt for major migration review
-        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        if: ${{ github.event.action == 'opened' && steps.metadata.outputs.update-type == 'version-update:semver-major' }}
         run: gh pr comment "$PR_URL" --body "⚠️ Major version bump — requires manual migration review, not auto-merged."
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
