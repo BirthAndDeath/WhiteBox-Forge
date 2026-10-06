@@ -1,7 +1,7 @@
-﻿use std::path::PathBuf;
+use std::path::PathBuf;
 
 use whitebox_core::sandbox::{
-    setup_sandbox_with, ApplyStatus, NetworkPorts, SandboxCapability, SandboxConfig,
+    ApplyStatus, NetworkPorts, SandboxCapability, SandboxConfig, setup_sandbox_with,
 };
 
 // 默认配置 = 全关闭（deny-by-default）：文件系统封闭、禁网、禁执行、禁提权、防调试。

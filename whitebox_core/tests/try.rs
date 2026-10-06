@@ -1,6 +1,5 @@
 use whitebox_core::sandbox::SandboxConfig;
 use whitebox_core::*;
-use whitebox_core::{SandboxHandle};
 
 #[test]
 fn try_use() -> Result<(), Box<dyn std::error::Error>> {
