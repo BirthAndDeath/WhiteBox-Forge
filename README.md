@@ -102,9 +102,9 @@ cargo run
 
 ## Contributing / 贡献
 
-Contributions of all kinds are welcome — bug reports, feature requests, documentation, and code. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide. In short: fork, branch, run `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test`, then open a Pull Request with a Conventional Commit message.
+Contributions of all kinds are welcome — bug reports, feature requests, documentation, and code. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide. In short: fork, branch, run `cargo clippy -- -D warnings` and `cargo test` (running `cargo fmt` first is recommended), then open a Pull Request with a Conventional Commit message.
 
-欢迎各种形式的贡献——错误报告、功能请求、文档和代码。完整指南见 [CONTRIBUTING.md](CONTRIBUTING.md)。简而言之：复刻仓库、创建分支、运行 `cargo fmt`、`cargo clippy -- -D warnings` 与 `cargo test`，然后以约定式提交信息打开一个 Pull Request。
+欢迎各种形式的贡献——错误报告、功能请求、文档和代码。完整指南见 [CONTRIBUTING.md](CONTRIBUTING.md)。简而言之：复刻仓库、创建分支、运行 `cargo clippy -- -D warnings` 与 `cargo test`（建议先跑 `cargo fmt`），然后以约定式提交信息打开一个 Pull Request。
 
 ## Support Us / 支持我们
 

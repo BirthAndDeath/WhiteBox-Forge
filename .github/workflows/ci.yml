@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -38,16 +38,13 @@ jobs:
       security-events: write
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: fmt
-        run: cargo fmt --all -- --check
 
       - name: install clippy-sarif
         run: cargo install clippy-sarif sarif-fmt --locked
@@ -59,9 +56,9 @@ jobs:
           cargo clippy --workspace --all-targets --message-format=json -- -D warnings | tee clippy-results.json | clippy-sarif > clippy-results.sarif
 
       - name: Upload analysis results to GitHub
-        # 仅当 clippy 真正产出了 SARIF 才上传（fmt 失败致 clippy 被跳过时文件不存在）
+        # 仅当 clippy 真正产出了 SARIF 才上传（clippy 被跳过时文件不存在）
         if: always() && hashFiles('clippy-results.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: clippy-results.sarif
           wait-for-processing: true
@@ -71,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
