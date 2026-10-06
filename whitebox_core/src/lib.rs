@@ -43,35 +43,120 @@ fn get_engine_config() -> wasmtime::Config {
     }
 }
 ///！用于确定全局状态，因此必须在一切core函数运行前运行！！喵！MIAO!
+
+/// worker 进程失败退出的阶段码。父进程通过 `wait()/try_wait()` 的退出码区分失败阶段。
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerExit {
+    Ok = 0,
+    /// 未知/未归类错误
+    Other = 1,
+    /// 帧协议 / IO 读取失败（管道损坏、长度非法）
+    Io = 2,
+    /// 帧 payload 反序列化失败（路径/输入/配置损坏）
+    Decode = 3,
+    /// wasm 模块读取失败（文件不可读、损坏）
+    Load = 4,
+    /// 实例化失败（WASI / linker / store）
+    Instantiate = 5,
+    /// 运行 `_start` 时 trap
+    Run = 6,
+}
+
+impl WorkerExit {
+    pub fn code(self) -> i32 {
+        self as i32
+    }
+
+    /// [`WorkerExit::code`] 的逆映射：父进程拿到子进程退出码后还原失败阶段。
+    /// 未知数字返回 `Err(该数字)`。
+    pub fn decode(code: i32) -> std::result::Result<Self, i32> {
+        match code {
+            0 => Ok(WorkerExit::Ok),
+            1 => Ok(WorkerExit::Other),
+            2 => Ok(WorkerExit::Io),
+            3 => Ok(WorkerExit::Decode),
+            4 => Ok(WorkerExit::Load),
+            5 => Ok(WorkerExit::Instantiate),
+            6 => Ok(WorkerExit::Run),
+            other => Err(other),
+        }
+    }
+}
+
+/// 带退出码的错误：`run_worker` 各阶段把底层错误按阶段包装进去。
+#[derive(Debug)]
+pub struct WorkerError {
+    pub code: WorkerExit,
+    source: anyhow::Error,
+}
+
+impl WorkerError {
+    fn new(code: WorkerExit, source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            code,
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for WorkerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
 pub fn init() -> anyhow::Result<()> {
     if std::env::var_os("__WASM_WORKER").is_some() {
         IS_WORKER.get_or_init(|| Arc::new(AtomicBool::new(true)));
-        run_worker()?; //错误传递
-        std::process::exit(0);
+        // 注：曾考虑让父进程捕获 worker 的 stderr 以获得结构化错误文本，但那本质是
+        // 异步字节流（需线程持续读取，与同步 wait() 语义冲突），不便同步处理，
+        // 故先用“阶段退出码”方案；结构化 stderr 捕获留作后续（见 TODO 相关讨论）。
+        match run_worker() {
+            Ok(()) => std::process::exit(WorkerExit::Ok.code()),
+            Err(e) => {
+                eprintln!("[whitebox] worker error (exit {}): {:#}", e.code.code(), e);
+                std::process::exit(e.code.code());
+            }
+        }
     }
     IS_WORKER.get_or_init(|| Arc::new(AtomicBool::new(false)));
     anyhow::Ok(())
 }
 ///基于环境变量识别，启动自己的进程来为自己打工（
-fn run_worker() -> anyhow::Result<()> {
+fn run_worker() -> Result<(), WorkerError> {
     let mut stdin = std::io::stdin().lock();
     //协议：三帧（payload 均 postcard 序列化）[wasm 路径 PathBuf][输入字节 Vec<u8>][沙箱配置]
-    let wasm_path_bytes = read_bytes(&mut stdin)?;
-    let wasm_path: PathBuf = postcard::from_bytes(&wasm_path_bytes)?;
-    let input_bytes = read_bytes(&mut stdin)?;
-    let input: Vec<u8> = postcard::from_bytes(&input_bytes)?;
-    let config_bytes = read_bytes(&mut stdin)?;
+    let wasm_path_bytes =
+        read_bytes(&mut stdin).map_err(|e| WorkerError::new(WorkerExit::Io, e))?;
+    let wasm_path: PathBuf = postcard::from_bytes(&wasm_path_bytes)
+        .map_err(|e| WorkerError::new(WorkerExit::Decode, e))?;
+    let input_bytes = read_bytes(&mut stdin).map_err(|e| WorkerError::new(WorkerExit::Io, e))?;
+    let input: Vec<u8> =
+        postcard::from_bytes(&input_bytes).map_err(|e| WorkerError::new(WorkerExit::Decode, e))?;
+    let config_bytes = read_bytes(&mut stdin).map_err(|e| WorkerError::new(WorkerExit::Io, e))?;
     if !config_bytes.is_empty() {
         //父进程传入的沙箱参数 → 全局配置
-        if let Ok(config) = postcard::from_bytes::<SandboxConfig>(&config_bytes) {
-            let _ = set_sandbox_config(config);
+        match postcard::from_bytes::<SandboxConfig>(&config_bytes) {
+            Ok(config) => {
+                let _ = set_sandbox_config(config);
+            }
+            Err(e) => {
+                // 配置损坏：fail-closed，拒绝运行（不落到默认配置）
+                return Err(WorkerError::new(WorkerExit::Decode, e));
+            }
         }
     }
     //先应用全局进程沙箱配置，不支持的配置项会打进 stderr 供审计
     apply_sandbox();
     //connect channel
-    run_wasm(wasm_path, &input)?;
-    anyhow::Ok(())
+    run_wasm(wasm_path, &input)
 }
 
 /// 应用全局沙箱配置并输出不支持项的警告
@@ -86,11 +171,13 @@ fn apply_sandbox() {
     }
 }
 //阻塞运行
-fn run_wasm(path: PathBuf, input: &Vec<u8>) -> anyhow::Result<()> {
-    let module = load_from_wasm_file(&path)?;
-    let sandbox = load_module(module, Arc::new(AtomicBool::new(false)))?; //后面的flag在此处是无用的
-    SandboxHandle::run_module_in_process(sandbox)?;
-    anyhow::Ok(())
+fn run_wasm(path: PathBuf, input: &Vec<u8>) -> Result<(), WorkerError> {
+    let module = load_from_wasm_file(&path).map_err(|e| WorkerError::new(WorkerExit::Load, e))?;
+    let sandbox = load_module_for_worker(module, Arc::new(AtomicBool::new(false)))
+        .map_err(|e| WorkerError::new(WorkerExit::Instantiate, e))?; //后面的flag在此处是无用的
+    SandboxHandle::run_module_for_worker(sandbox)
+        .map_err(|e| WorkerError::new(WorkerExit::Run, e))?;
+    Ok(())
 }
 use std::io::Read;
 
@@ -169,91 +256,74 @@ pub fn load_wasm_bytes(wat: Vec<u8>) -> Result<Module, wasmtime::Error> {
     Ok(module)
 }
 //pub fn load_from_cwasm_file() {}
-pub fn load_module(
-    module: Module,
-    shutdown_flag: Arc<AtomicBool>,
-) -> Result<WasmSandbox<HostState>, wasmtime::Error> {
+
+/// 构建 Linker：注册 host_func + WASI（worker 用同步、thread 用异步）
+fn build_linker(async_wasi: bool) -> Result<Linker<HostState>, wasmtime::Error> {
     let mut linker = Linker::new(&ENGINE);
-    if IS_WORKER.get().is_some_and(|b| b.load(Ordering::Relaxed)) {
-        // 接入 WASI（preview1：给 core module 提供 wasi_snapshot_preview1 导入）
-        // 默认继承宿主 stdio；后续可按 SandboxConfig::fs_rules 预打开文件系统
-        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| {
-            &mut state.wasi
-        })?;
-
-        linker.func_wrap(
-            "host",
-            "host_func",
-            |caller: Caller<'_, HostState>, param: i32| {
-                println!("Got {} from WebAssembly", param);
-                println!("my host state is: {}", caller.data().marker);
-            },
-        )?;
-        let wasi_ctx = wasmtime_wasi::WasiCtxBuilder::new()
-            .inherit_stdio()
-            .build_p1();
-        let mut store: Store<HostState> = Store::new(
-            &ENGINE,
-            HostState {
-                wasi: wasi_ctx,
-                marker: 4,
-                shutdown_requested_only_for_threadfallback: shutdown_flag,
-            },
-        );
-
-        //store.set_fuel(u64::MAX)?;考虑在开发者模式中加入可配置用以跟踪资源消耗？fuel/time
-
-        let instance = linker.instantiate(&mut store, &module)?;
-        let sandbox = WasmSandbox::new(instance, store);
-        Ok(sandbox)
-    } else {
-        //不是worker模式是线程
-        // 接入 WASI（preview1：给 core module 提供 wasi_snapshot_preview1 导入）
-        // 默认继承宿主 stdio；后续可按 SandboxConfig::fs_rules 预打开文件系统
+    if async_wasi {
         wasmtime_wasi::p1::add_to_linker_async(&mut linker, |state: &mut HostState| {
             &mut state.wasi
         })?;
-
-        linker.func_wrap(
-            "host",
-            "host_func",
-            |caller: Caller<'_, HostState>, param: i32| {
-                println!("Got {} from WebAssembly", param);
-                println!("my host state is: {}", caller.data().marker);
-            },
-        )?;
-        let wasi_ctx = wasmtime_wasi::WasiCtxBuilder::new()
-            .inherit_stdio()
-            .build_p1();
-        let mut store: Store<HostState> = Store::new(
-            &ENGINE,
-            HostState {
-                wasi: wasi_ctx,
-                marker: 4,
-                shutdown_requested_only_for_threadfallback: shutdown_flag,
-            },
-        );
-
+    } else {
         //store.set_fuel(u64::MAX)?;考虑在开发者模式中加入可配置用以跟踪资源消耗？fuel/time
-
-        // 只在 async(非 worker) 分支配置 epoch 打断（host 引擎才启用 epoch_interruption）：
-        // 必须在 instantiate_async 之前设置，否则默认 deadline=0（“恒已过期”）+ 回调未注册，
-        // 首个 epoch 检查点直接 Trap::Interrupt。
-        store.set_epoch_deadline(1);
-        store.epoch_deadline_callback(SandboxHandle::epoch_callback);
-
-        // add_to_linker_async 注册的导入会把 store 标记为 async-required，
-        // 同步 instantiate 会被拒（“use *_async”），因此这里走 instantiate_async。
-        // 注意：load_module 是同步入口，内部临时起一个 current-thread runtime；
-        // 若调用方已处于 tokio runtime，请改用 async 版加载入口。
-        let instance = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| wasmtime::Error::msg(format!("tokio runtime: {e}")))?
-            .block_on(linker.instantiate_async(&mut store, &module))?;
-        let sandbox = WasmSandbox::new(instance, store);
-        Ok(sandbox)
+        //不是worker模式是线程
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| {
+            &mut state.wasi
+        })?;
     }
+    linker.func_wrap(
+        "host",
+        "host_func",
+        |caller: Caller<'_, HostState>, param: i32| {
+            println!("Got {} from WebAssembly", param);
+            println!("my host state is: {}", caller.data().marker);
+        },
+    )?;
+    Ok(linker)
+}
+
+/// 构建 Store（worker / thread 共用）：WASI 默认继承 stdio，注入 shutdown flag。
+/// 后续可按 SandboxConfig::fs_rules 预打开文件系统（preopen）。
+fn build_store(shutdown_flag: Arc<AtomicBool>) -> Store<HostState> {
+    let wasi_ctx = wasmtime_wasi::WasiCtxBuilder::new()
+        .inherit_stdio()
+        .build_p1();
+    Store::new(
+        &ENGINE,
+        HostState {
+            wasi: wasi_ctx,
+            marker: 4,
+            shutdown_requested_only_for_threadfallback: shutdown_flag,
+        },
+    )
+}
+
+/// worker（进程）用加载：同步 linker + 同步 instantiate。
+/// worker 引擎是纯同步配置，无需 tokio，也不会踩 epoch 问题。
+pub fn load_module_for_worker(
+    module: Module,
+    shutdown_flag: Arc<AtomicBool>,
+) -> Result<WasmSandbox<HostState>, wasmtime::Error> {
+    let linker = build_linker(false)?;
+    let mut store = build_store(shutdown_flag);
+    let instance = linker.instantiate(&mut store, &module)?;
+    Ok(WasmSandbox::new(instance, store))
+}
+
+/// thread（宿主/线程回落）用加载：异步 linker + instantiate_async。
+/// 必须在调用方自己的 tokio runtime 内 await（禁止再起嵌套 runtime）。
+pub async fn load_module_for_thread(
+    module: Module,
+    shutdown_flag: Arc<AtomicBool>,
+) -> Result<WasmSandbox<HostState>, wasmtime::Error> {
+    let linker = build_linker(true)?;
+    let mut store = build_store(shutdown_flag);
+    // epoch 打断：必须在 instantiate_async 之前设置，否则默认 deadline=0（恒已过期）会 Trap::Interrupt
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_callback(SandboxHandle::epoch_callback);
+    // add_to_linker_async 注册的导入会把 store 标记为 async-required，只能走 instantiate_async
+    let instance = linker.instantiate_async(&mut store, &module).await?;
+    Ok(WasmSandbox::new(instance, store))
 }
 use std::process::{Child, Command, Stdio};
 
@@ -344,12 +414,15 @@ impl SandboxHandle {
                     //线程模式没有任何进程隔离，仅尽力应用沙箱限制
                     let _ = set_sandbox_config(config);
                     apply_sandbox();
-                    let module = load_from_wasm_file(&path)?;
-                    let sandbox = load_module(module, shutdown_flag_clone)?;
+                    // 加载与运行在同一个 current-thread runtime 内闭环，避免嵌套 runtime panic
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
-                    let result = rt.block_on(Self::run_module_in_thread(sandbox, rx));
+                    let result = rt.block_on(async move {
+                        let module = load_from_wasm_file(&path)?;
+                        let sandbox = load_module_for_thread(module, shutdown_flag_clone).await?;
+                        Self::run_module_for_thread(sandbox, rx).await
+                    });
                     result?; //传播错误
 
                     Ok(())
@@ -372,7 +445,7 @@ impl SandboxHandle {
             Ok(UpdateDeadline::Continue(1))
         }
     }
-    pub fn run_module_in_process(
+    pub fn run_module_for_worker(
         mut sandbox: WasmSandbox<HostState>,
     ) -> Result<(), wasmtime::error::Error> {
         let start = sandbox
@@ -382,7 +455,7 @@ impl SandboxHandle {
         Ok(())
     }
     // watch 取消线路暂时整体注释：关闭统一走 shutdown() 的 epoch/increment + HostState flag
-    pub async fn run_module_in_thread(
+    pub async fn run_module_for_thread(
         mut sandbox: WasmSandbox<HostState>,
         _rx: watch::Receiver<ThreadCommand>,
     ) -> Result<(), wasmtime::error::Error> {
@@ -424,5 +497,28 @@ impl SandboxHandle {
 
         /*无参数启动 */
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerExit;
+
+    #[test]
+    fn worker_exit_code_roundtrip() {
+        // code() 与 decode() 互逆，且未知数字报错
+        for want in [
+            WorkerExit::Ok,
+            WorkerExit::Other,
+            WorkerExit::Io,
+            WorkerExit::Decode,
+            WorkerExit::Load,
+            WorkerExit::Instantiate,
+            WorkerExit::Run,
+        ] {
+            let got = WorkerExit::decode(want.code()).expect("known code must decode");
+            assert_eq!(got, want);
+        }
+        assert_eq!(WorkerExit::decode(99), Err(99));
     }
 }

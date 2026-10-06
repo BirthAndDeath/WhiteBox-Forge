@@ -26,15 +26,16 @@ fn try_use() -> Result<(), Box<dyn std::error::Error>> {
         )
     "#;
     println!("If you see this, --nocapture is enabled!");
-    // load_* 现在返回 Module，需经 load_module(module, shutdown_flag) 实例化
+    // 加载 + 运行在同一个 current-thread runtime 内闭环（thread 路径，避免嵌套 runtime）
     let module = load_wasm_bytes(wat.into())?;
-    let sandbox = load_module(module, Arc::new(AtomicBool::new(false)))?;
-
-    // run_module 现在是 async：需要取消通道 + 一个 current-thread runtime 驱动
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
     let (_tx, rx) = tokio::sync::watch::channel(ThreadCommand::Empty);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(SandboxHandle::run_module_in_thread(sandbox, rx))?;
+    rt.block_on(async {
+        let sandbox = load_module_for_thread(module, shutdown_flag).await?;
+        SandboxHandle::run_module_for_thread(sandbox, rx).await
+    })?;
     Ok(())
 }
