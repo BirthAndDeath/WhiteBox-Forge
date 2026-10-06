@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: audit
+        # 若出现仅存在于 dev/工具链中的已知 advisory，在此按 `--ignore RUSTSEC-xxxx` 说明依据（OpenWire 同款做法）
+        run: cargo audit
+
+  cargo-clippy:
+    name: cargo clippy (workspace, hard gate + SARIF)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: install clippy-sarif
+        run: cargo install clippy-sarif sarif-fmt --locked
+
+      - name: clippy (workspace, hard gate + SARIF)
+        # set -o pipefail 保证 -D warnings 硬失败不被管道吞掉；tee 保存原始 JSON 供 SARIF 生成。
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --message-format=json -- -D warnings | tee clippy-results.json | clippy-sarif > clippy-results.sarif
+
+      - name: Upload analysis results to GitHub
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: clippy-results.sarif
+          wait-for-processing: true
+
+  cargo-test:
+    name: cargo test (whitebox_core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test (core)
+        # 排除 whitebox-forge（Slint GUI crate，ubuntu runner 上无图形系统依赖）
+        run: cargo test -p whitebox_core --all-features

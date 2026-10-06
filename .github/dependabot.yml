@@ -21,9 +21,6 @@ updates:
       tokio:
         patterns:
           - "tokio*"
-        update-types:
-          - "minor"
-          - "patch"
       serialization:
         patterns:
           - "postcard"

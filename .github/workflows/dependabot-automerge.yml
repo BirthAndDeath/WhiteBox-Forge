@@ -1,0 +1,41 @@
+name: dependabot-automerge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  pull-requests: write
+  contents: write
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - uses: dependabot/fetch-metadata@v2
+        id: metadata
+
+      # 合并前必须等必需检查（clippy/fmt/test/audit）通过；任一失败则本步退出非零 → 跳过自动合并
+      - name: Wait for required CI checks
+        if: ${{ steps.metadata.outputs.update-type == 'version-update:semver-minor' || steps.metadata.outputs.update-type == 'version-update:semver-patch' }}
+        run: gh pr checks "$PR_URL" --watch --required
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 仅 minor / patch 自动合并（squash），major 交由人工
+      - name: Enable auto-merge for minor and patch
+        if: ${{ steps.metadata.outputs.update-type == 'version-update:semver-minor' || steps.metadata.outputs.update-type == 'version-update:semver-patch' }}
+        run: gh pr merge --auto --squash --delete-branch "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # major：不自动合并，留提示触发人工迁移审查
+      - name: Prompt for major migration review
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        run: gh pr comment "$PR_URL" --body "⚠️ Major version bump — requires manual migration review, not auto-merged."
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
