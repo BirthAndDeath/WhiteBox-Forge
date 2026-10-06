@@ -1,3 +1,4 @@
+use whitebox_core::SandboxHandle;
 use whitebox_core::sandbox::SandboxConfig;
 use whitebox_core::*;
 
