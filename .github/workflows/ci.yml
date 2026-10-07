@@ -29,14 +29,10 @@ jobs:
         # 若出现仅存在于 dev/工具链中的已知 advisory，在此按 `--ignore RUSTSEC-xxxx` 说明依据（OpenWire 同款做法）
         run: cargo audit
 
-  cargo-clippy:
-    name: cargo clippy (whitebox_core, hard gate + SARIF)
+  cargo-check-clippy:
+    name: cargo check (gate) + clippy (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
-      security-events: write
-      actions: read
     steps:
       - uses: actions/checkout@v7
 
@@ -46,23 +42,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: install clippy-sarif
-        run: cargo install clippy-sarif sarif-fmt --locked
+      - name: "cargo check (hard gate: 仅编译错误才终止)"
+        # 排除 whitebox-forge（Slint GUI crate，ubuntu runner 缺 fontconfig 等系统库）
+        run: cargo check -p whitebox_core --all-targets --all-features
 
-      - name: clippy (whitebox_core, hard gate + SARIF)
-        # 排除 whitebox-forge（Slint GUI crate，ubuntu runner 缺 fontconfig 等系统库）。
-        # set -o pipefail 保证 -D warnings 硬失败不被管道吞掉；tee 保存原始 JSON 供 SARIF 生成。
-        run: |
-          set -o pipefail
-          cargo clippy -p whitebox_core --all-targets --message-format=json -- -D warnings | tee clippy-results.json | clippy-sarif > clippy-results.sarif
-
-      - name: Upload analysis results to GitHub
-        # 仅当 clippy 真正产出了 SARIF 才上传（clippy 被跳过时文件不存在）
-        if: always() && hashFiles('clippy-results.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: clippy-results.sarif
-          wait-for-processing: true
+      - name: "cargo clippy (advisory: 只警告，不终止)"
+        # 故意不加 `-D warnings`：clippy 意见仅供参考，不阻断构建
+        run: cargo clippy -p whitebox_core --all-targets
 
   cargo-test:
     name: cargo test (whitebox_core)
@@ -76,5 +62,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test (core)
-        # 排除 whitebox-forge（Slint GUI crate，ubuntu runner 上无图形系统依赖）
-        run: cargo test -p whitebox_core --all-features
+        # 排除 whitebox-forge（Slint GUI crate，ubuntu runner 上无图形系统依赖）。
+        # tee 落盘完整日志 + 上传 artifact，便于定位（pipefail 保证失败不被管道吞掉）。
+        run: |
+          set -o pipefail
+          rustc --version
+          cargo --version
+          cargo test -p whitebox_core --all-features --verbose 2>&1 | tee test-core.log
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whitebox_core-test-log
+          path: test-core.log

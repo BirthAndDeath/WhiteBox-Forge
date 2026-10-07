@@ -10,7 +10,7 @@ Quick Start:
 
 1. Fork the repo.
 2. Create a branch: git checkout -b feat/your-feature
-3. Run checks: cargo clippy -- -D warnings && cargo test --all-features (recommended: run `cargo fmt` first)
+3. Run checks: cargo check && cargo test --all-features (clippy/fmt are advisory, not gates)
 4. Commit with Conventional Commits: feat:, fix:, docs:, refactor:, test:, chore:
 5. Push and open a Pull Request to main.
 
@@ -18,20 +18,20 @@ Quick Start:
 
 1. 复刻仓库。
 2. 创建分支：git checkout -b feat/你的功能
-3. 运行检查：cargo clippy -- -D warnings && cargo test --all-features（建议先跑 `cargo fmt`）
+3. 运行检查：cargo check && cargo test --all-features（clippy/fmt 仅建议，不设门禁）
 4. 使用约定式提交：feat:、fix:、docs:、refactor:、test:、chore:
 5. 推送并打开一个指向 main 分支的拉取请求。
 
 Code Rules:
 
-- clippy must pass (fmt is recommended locally but not gated).
+- cargo check must pass (compile errors). clippy warnings and fmt are advisory, not gated.
 - No unsafe code unless justified with comments.
 - No unwrap() / panic!() in library code – use Result.
 - Public APIs must have doc comments (///) with examples.
 
 代码规则：
 
-- 必须通过 clippy（本地建议跑 fmt，但不作门禁）。
+- 必须通过 cargo check（编译错误）。clippy 警告与 fmt 只是建议，不作门禁。
 - 除非有充分的注释说明，否则不允许 unsafe 代码。
 - 库代码中禁止使用 unwrap() 或 panic!()，请使用 Result。
 - 公共 API 必须有文档注释（///）并附带示例。

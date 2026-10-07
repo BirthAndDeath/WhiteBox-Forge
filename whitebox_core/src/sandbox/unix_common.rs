@@ -218,16 +218,17 @@ pub fn landlock(
     }
 
     // 临时目录写放行（sealed 基线上的显式 grant）
-    if temp_allow_write && !readonly_fs {
-        if let Ok(temp) = CString::new(std::env::temp_dir().as_os_str().as_bytes()) {
-            let fd = unsafe { libc::open(temp.as_ptr(), libc::O_PATH) };
-            if fd >= 0 {
-                let ok = add_rule(fd, read_bits | write_bits);
-                unsafe { libc::close(fd) };
-                if !ok {
-                    unsafe { libc::close(ruleset as i32) };
-                    return false;
-                }
+    if temp_allow_write
+        && !readonly_fs
+        && let Ok(temp) = CString::new(std::env::temp_dir().as_os_str().as_bytes())
+    {
+        let fd = unsafe { libc::open(temp.as_ptr(), libc::O_PATH) };
+        if fd >= 0 {
+            let ok = add_rule(fd, read_bits | write_bits);
+            unsafe { libc::close(fd) };
+            if !ok {
+                unsafe { libc::close(ruleset as i32) };
+                return false;
             }
         }
     }
