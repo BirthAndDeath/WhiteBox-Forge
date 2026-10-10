@@ -8,6 +8,10 @@ A transparent, capability-based sandbox for WebAssembly applications. It gives u
 
 **状态：早期开发阶段。** 核心执行引擎与进程隔离框架已就绪，但 GUI 和大部分沙箱能力尚未接入。
 
+<p align="center">
+  <img src="assets/whitebox_forge.svg" alt="WhiteBox-Forge" width="180">
+</p>
+
 ## Features / 功能特性
 
 - **Transparent sandboxing** — every WebAssembly application runs in an isolated environment you can inspect, not a black box.
@@ -126,7 +130,6 @@ Licensed under the [Apache License 2.0](LICENSE).
 ## Based on / 基于
 
 [![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-light.svg#gh-light-mode-only)](https://slint.dev)
-[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-dark.svg#gh-dark-mode-only)](https://slint.dev)
 
 Powered by [Wasmtime](https://wasmtime.dev/) and [Wasmtime-WASI](https://github.com/bytecodealliance/wasmtime-wasi).
 
