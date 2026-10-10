@@ -45,7 +45,6 @@
 
 ## 已知缺口（详见 TODO.md）
 
-- `src/main.rs` 未调 `whitebox_core::init()` → 进程 worker 端到端未通（协作项）。
 - stdout 结果通道未实现（`Runner::Process` 不读 stdout，wasm 大量写会 pipe 阻塞；`WasiStdio::Capture` 检索也未接线）。
 - `max_memory_bytes` 未接 `ResourceLimiter`（线程模式无 OS 内存兜底）。
 - `input` 帧未接到 WASI stdin。

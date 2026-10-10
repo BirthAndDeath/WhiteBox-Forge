@@ -2,10 +2,6 @@
 
 ## P0 链路/可用性
 
-- [ ] **`src/main.rs` 未调用 `whitebox_core::init()`**
-  - `src/main.rs:1-3`（`println!("Hello, world!")`）
-  - 相关：`whitebox_core/src/lib.rs`（`init()` / `run_source` spawn 自身）
-  - 后果：进程 worker 由 `current_exe()` 重启自身，但子进程进不了 `run_worker` → 进程隔离链路端到端不通。
 - [ ] **stdout 结果通道缺失**
   - `run_source` 中 `stdout(Stdio::piped())` 但从不读取；`Runner::Process(child)` 只持有，无消费线程
   - worker 侧 `inherit_stdio`
@@ -76,5 +72,5 @@
 - [ ] **真机覆盖 Linux/macOS 沙箱（Landlock/seatbelt/seccomp）**
   - `whitebox_core/tests/sandbox.rs` 目前纯逻辑；平台实现 `sandbox/linux.rs`、`sandbox/macos.rs`、`sandbox/unix_common.rs`
 - [ ] **线程关闭端到端**：`SandboxHandle::shutdown()` → `increment_epoch()` → `epoch_callback` Err 打断 → join 返回。
-- [ ] **进程 worker 链路端到端**（依赖 P0 前两项）
-  - 需：main 接 `init()` + 授权 wasm 目录（或 `run_data` 字节路径）+ stdout 结果校验。
+- [ ] **进程 worker 链路端到端**（依赖 P0 的 stdout 结果通道）
+  - 需：授权 wasm 目录（或 `run_data` 字节路径）+ stdout 结果校验。
