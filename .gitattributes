@@ -1,0 +1,32 @@
+# Normalize line endings so text files don't churn across Windows/macOS/Linux
+# checkouts: store LF in the repo and check out LF everywhere.
+* text=auto eol=lf
+
+# Explicitly binary — never normalize.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.icns  binary
+*.ttf   binary
+*.otf   binary
+*.woff  binary
+*.woff2 binary
+*.wasm  binary
+*.crate binary
+*.zip   binary
+
+# Source / text that must stay LF and never be misdetected as binary.
+*.rs     text eol=lf
+*.toml   text eol=lf
+*.md     text eol=lf
+*.wit    text eol=lf
+*.wat    text eol=lf
+*.slint  text eol=lf
+*.svg    text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.json   text eol=lf
+*.lock   text eol=lf
+Cargo.lock text eol=lf
