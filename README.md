@@ -1,5 +1,14 @@
 # WhiteBox-Forge
 
+<p align="center">
+  <a href="https://github.com/BirthAndDeath/WhiteBox-Forge/releases/latest">
+    <img src="https://img.shields.io/github/v/release/BirthAndDeath/WhiteBox-Forge?style=flat-square&sort=semver" alt="Latest release">
+  </a>
+  <a href="./LICENSE">
+    <img src="https://img.shields.io/github/license/BirthAndDeath/WhiteBox-Forge?style=flat-square" alt="License: Apache-2.0">
+  </a>
+</p>
+
 A transparent, capability-based sandbox for WebAssembly applications. It gives users fine-grained control over filesystem access and allows complete rollback of any changes — turning every app into a temporary, auditable environment.
 
 一个透明、基于能力（capability）的 WebAssembly 应用沙箱。它为用户提供对文件系统访问的细粒度控制，并允许完全回滚任何更改——让每个应用都变成一个临时的、可审计的环境。
