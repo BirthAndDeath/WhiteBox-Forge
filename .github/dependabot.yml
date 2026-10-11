@@ -6,7 +6,11 @@ updates:
       interval: "weekly"
       day: "monday"
       time: "08:00"
-    open-pull-requests-limit: 10
+    # open-pull-requests-limit 只统计“版本更新”PR（安全更新 PR 不受此限、不占额度）。
+    # 分组后版本更新 PR 数 = 分组数（wasmtime/slint/tokio/serialization/cli/misc 共 6 组，每组至多 1 个）。
+    # 设 6 = 与分组数对齐：不饿死任何组，同时给 CI 峰值封顶（wasmtime 全量编译约 12 分钟，避免一次 10 个 PR 打满 runner）。
+    # 想要更硬的节流可下调（代价：某组要等别的 PR 合并后才开）。
+    open-pull-requests-limit: 6
     labels:
       - "dependencies"
       - "rust"
@@ -28,6 +32,11 @@ updates:
       cli:
         patterns:
           - "clap*"
+      # 兜底组：其余直接依赖（anyhow/rayon/libc/windows-sys 等）打包，避免每个各开一个 PR。
+      # 必须放在最后（首个匹配的组胜出，具名组优先）。
+      misc:
+        patterns:
+          - "*"
     versioning-strategy: "auto"
 
   - package-ecosystem: "github-actions"
@@ -36,5 +45,12 @@ updates:
       interval: "weekly"
       day: "monday"
       time: "08:00"
+    # actions 打包成一组 → 版本更新通常只有 1 个 PR；限 3 给偶发的多组/未匹配项留缓冲。
+    # （安全更新 PR 不受此限，故无需为它留额度。）
+    open-pull-requests-limit: 3
     labels:
       - "ci"
+    groups:
+      actions:
+        patterns:
+          - "*"

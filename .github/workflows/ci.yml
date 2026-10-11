@@ -29,7 +29,7 @@ jobs:
         # 若出现仅存在于 dev/工具链中的已知 advisory，在此按 `--ignore RUSTSEC-xxxx` 说明依据（OpenWire 同款做法）
         run: cargo audit
 
-  cargo-check-clippy:
+  check-clippy:
     name: cargo check (gate) + clippy (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -50,10 +50,16 @@ jobs:
         # 故意不加 `-D warnings`：clippy 意见仅供参考，不阻断构建
         run: cargo clippy -p whitebox_core --all-targets
 
-  cargo-test:
-    name: cargo test (whitebox_core)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  test-matrix:
+    name: test (${{ matrix.os }})
+    # 平台矩阵：覆盖 linux/macos/windows——同时编译并运行各自的沙箱平台实现
+    # （linux.rs/macos.rs/unix_common.rs 在 Windows 上被 cfg 排除，只有此矩阵能验证）。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
 
@@ -61,18 +67,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo test (core)
-        # 排除 whitebox-forge（Slint GUI crate，ubuntu runner 上无图形系统依赖）。
-        # tee 落盘完整日志 + 上传 artifact，便于定位（pipefail 保证失败不被管道吞掉）。
+      - name: "cargo test -p whitebox_core (hard gate)"
+        # bash 保证 pipefail/tee 在三平台一致（windows runner 自带 Git Bash）
+        shell: bash
         run: |
           set -o pipefail
           rustc --version
           cargo --version
-          cargo test -p whitebox_core --all-features --verbose 2>&1 | tee test-core.log
+          cargo test -p whitebox_core --all-features --verbose 2>&1 | tee test-${{ matrix.os }}.log
+
+      - name: "cargo test -p whitebox-forge (GUI crate)"
+        # ubuntu runner 缺 fontconfig 等 Slint 依赖，故 GUI crate 的测试在 macos/windows 验证
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo test -p whitebox-forge --all-targets
 
       - name: Upload test log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: whitebox_core-test-log
-          path: test-core.log
+          name: test-log-${{ matrix.os }}
+          path: test-${{ matrix.os }}.log
