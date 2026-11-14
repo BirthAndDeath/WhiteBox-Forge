@@ -1,0 +1,21 @@
+# cargo-deny 配置。
+# CI 门禁只跑 `advisories` / `bans` / `sources`；
+# `licenses` 暂不进门禁（Slint 为多许可证/GPL，需单独评审），后续可加一条 advisory 报告。
+
+[advisories]
+# 有 RustSec 漏洞 / yanked 依赖 → 阻断
+yanked = "deny"
+# 门禁不因 unmaintained 阻断（这些是无可安全升级的传递依赖）；信息报告交给 cargo audit --warnings
+unmaintained = "none"
+ignore = []
+
+[bans]
+# 同一 crate 多版本 / 通配符依赖：仅警告，不阻断
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+
+[sources]
+# 只信 crates.io；未知 registry / git 来源阻断
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   cargo-audit:
-    name: cargo audit
+    name: cargo audit (info)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -25,9 +25,24 @@ jobs:
       - name: install cargo-audit
         run: cargo install cargo-audit --locked
 
-      - name: audit
-        # 若出现仅存在于 dev/工具链中的已知 advisory，在此按 `--ignore RUSTSEC-xxxx` 说明依据（OpenWire 同款做法）
+      - name: audit (informational)
+        # 信息报告：不阻断工作流。安全门禁由 cargo-deny 的 advisories 负责。
+        continue-on-error: true
         run: cargo audit
+
+  cargo-deny:
+    name: cargo deny (gate: advisories/bans/sources)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # 门禁：RustSec 漏洞 / 来源白名单 / 依赖规则（配置见仓库根 deny.toml）
+      # licenses 不在此门禁（Slint 多许可证/GPL，需单独评审）
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: advisories bans sources
 
   check-clippy:
     name: cargo check (gate) + clippy (advisory)
