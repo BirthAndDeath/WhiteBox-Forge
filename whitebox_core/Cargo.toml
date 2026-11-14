@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 [lib]
 crate-type = ["lib"]
+
+# `portable`：把所有自身目录放到可执行文件所在目录下，不写 OS 用户目录。
+# `portable`: keep all app-owned directories beside the executable, not in OS user dirs.
+[features]
+portable = []
+
 [dependencies]
 anyhow = "1.0.104"
 postcard = { version = "1.1", features = ["use-std"] }
@@ -21,10 +27,19 @@ wasmtime = { version = "49.0.2", default-features = false, features = [
 ] }
 wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p2"] }
 
+# `directories` 仅用于桌面平台的自身目录定位；移动端（Android/iOS）暂不引入，
+# 由 `dir::get_dir` 的 `todo!()` 占位。
+# `directories` is only used for desktop directory resolution; mobile (Android/iOS) does
+# not pull it in yet and `dir::get_dir` uses `todo!()` there.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+directories = "6.0.0"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Threading",

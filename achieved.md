@@ -55,11 +55,11 @@
 
 - 每面默认最小值（`Inherit`/ 空 / `None` / `Host` / `Os`）；配置一经出现不可再"静默降级"。
 - 可兑现集：当前仅 p2；未兑现或与 L1 冲突的配置由 `validate` 在启动前拒绝（L2 fail-closed）。
-- 与 L1 求交：`wasi_sockets ⊆ network_ports`、`wasi_preopens ⊆ fs_rules`。
+- 与 L1 求交：`wasi_sockets ⊆ network_ports` 由 `validate` 强制；preopen 的 L1 只读/白名单一致性由 `wasi_preopen_ro` 统一保持，**未**在 `validate` 中做 `wasi_preopens ⊆ fs_rules` 的通用求交（`build_store` 打开宿主目录失败即 L2 fail-closed）。
 
 ### 接入步骤
 
-- [x] 状态机枚举/字段/builder/serde/`Default`・`open()`/`validate`（L1∩L2 求交）全部落地。
+- [x] 状态机枚举/字段/builder/serde/`Default`・`open()`/`validate`（sockets 与 `network_ports` 求交；preopen 由 `wasi_preopen_ro` 保持一致）全部落地。
 - [x] `WasiCtxBuilder` 的可配置项已全部映射进 `SandboxConfig`（`wasi_ip_name_lookup`/`wasi_max_random_size`/`wasi_initial_cwd`/`wasi_allow_blocking_current_thread`；`inherit_env`/`inherit_args`/`inherit_network` 等宿主继承项按 Deny-by-Default 不暴露）。
 - [x] `build_store` 逐面接线；p1 路径整体移除（组件/p2-only）。
 - [x] Deterministic clocks（`tests/wasi_clocks.rs`）、Seeded random（`tests/wasi_random.rs`）guest 级 e2e；sockets 端口策略单测（`tests::socket_policy_allow_deny_loopback_none`）；config 级测试见 `tests/sandbox.rs`。

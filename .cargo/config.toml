@@ -9,3 +9,13 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
 
 [source.sjtu]
 registry = "sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/"
+
+# 本机构建：为宿主平台构建 release 版 whitebox-forge。
+# 追加参数会透传，例如 `cargo build-local --features portable`。
+# Local build: release whitebox-forge for the host platform. Extra arguments are
+# forwarded, e.g. `cargo build-local --features portable`.
+[alias]
+build-local = "build --release -p whitebox-forge"
+# 便携构建：启用 `portable`，配置/数据/缓存等只写可执行文件所在目录。
+# Portable build: enable `portable` so config/data/cache stay beside the executable.
+build-portable = "build --release -p whitebox-forge --features portable"

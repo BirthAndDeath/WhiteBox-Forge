@@ -65,6 +65,14 @@
 - [ ] **错误类型不统一**：`wasmtime::Error` / `anyhow` / `WorkerError` 混用，边界转换散布。
   - 改：统一在 run/wait 边界收敛。
 
+### 构建 / 发布（考虑，未排期）
+
+- [ ] **构建可复现（评估后暂不做）**：`--locked` 只固定 crate 版本；`dtolnay/rust-toolchain@stable` 与 `*-latest` runner 仍会漂移，且二进制含绝对路径、链接器 UUID/时间戳，tar/zip 的 mtime/owner/顺序也不固定。
+  - 现状：`release.yml` 已用 `Swatinem/rust-cache@v2`（构建缓存已具备）；发布构建可考虑 `cache-targets: false` 只缓存 registry/git。
+  - 「可验证」低成本方案：固定 `rust-toolchain.toml`（如 `1.98.1`）+ runner 镜像，并随产物发布 `SHA256SUMS`。
+  - 「字节级」成本较高：再加 `--remap-path-prefix`、`-C strip=symbols`、平台链接 flags（`/Brepro`、`-Wl,-no_uuid`、`-Wl,--build-id=none`）与 `SOURCE_DATE_EPOCH` + 可复现 tar/zip。
+  - 结论：非存证需求下不追求字节级；先保留校验和思路即可。
+
 ### DX / 文档
 
 - [ ] **CLI 未暴露新面**：`src/main.rs` 仅 `--stdio/--timeout-ms/--no-sandbox/--preopen-ro`；sockets/clocks/random/initial-cwd/max-random-size 无 flag。
