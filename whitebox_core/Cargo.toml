@@ -10,7 +10,15 @@ postcard = { version = "1.1", features = ["use-std"] }
 rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.53.2", features = ["macros"] }
-wasmtime = { version = "49.0.2", features = ["cache"] }
+# 关闭默认特性以剔除 `cache`（其 zstd 依赖有未修复 advisory；且我们尚未启用编译缓存）。
+# 其余与 wasmtime 49 默认特性集一致（defaults minus cache）。
+wasmtime = { version = "49.0.2", default-features = false, features = [
+    "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null",
+    "wat", "profiling", "parallel-compilation", "cranelift", "pooling-allocator",
+    "demangle", "addr2line", "coredump", "debug-builtins", "runtime",
+    "component-model", "component-model-async", "threads", "stack-switching",
+    "std", "debug", "compile-time-builtins", "wit-parser",
+] }
 wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p2"] }
 
 [target.'cfg(windows)'.dependencies]

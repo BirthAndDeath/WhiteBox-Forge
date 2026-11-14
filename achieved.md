@@ -14,7 +14,7 @@
 
 ## P1 健壮性/安全
 
-- [x] ~~**多实例配置互相污染**~~ → 已修复：`build_store`/`load_component_for_worker/_thread`/`run_wasm` 改为**显式接收 `&SandboxConfig`**，线程回退用 `apply_sandbox_with(&config)` 不再写进程级全局；worker 保留帧 3 → 全局（L1）。
+- [x] ~~**多实例配置互相污染**~~ → 已修复：`build_store`/`load_component_for_worker/_thread`/`run_wasm` 改为**显式接收 `&SandboxConfig`** 不再写进程级全局；worker 保留帧 3 → 全局（L1）。线程回退**不再应用 L1**（见「安全加固」）。
 - [x] **`get_engine_config().expect("you must call init")`** → 已改安全化：未 init 不再 panic（按非 worker 处理）；公开入口 `require_init()` 提前返回错误。
 - [x] **`increment_epoch()` 引擎级广播 + 关闭/超时语义补全** → 已补：
   - 新增 `wait_timeout` / `wait_output_timeout`（进程超时 `kill`，线程超时置标志 + **循环轻推 epoch**，超宽限 abandon 并返回错误）；
@@ -25,7 +25,7 @@
 
 ## P2 工程/清理
 
-- [x] **线程回退无进程隔离** → 回退到线程时输出 `eprintln!` 降级警告（说明无进程隔离、L1 限制作用于宿主）。
+- [x] **线程回退无进程隔离** → 回退到线程时输出 `eprintln!` 降级警告（说明无进程隔离；且**不施加 L1**，见「安全加固」）。
 - [x] **`input` 帧未接线到 WASI stdin** → 新增 `run_with_input` / `run_data_with_input`；帧 2 传真实输入；`build_store` 用 `MemoryInputPipe` 喂 WASI stdin。
 - [x] **死代码/未用** → 已清理：移除 `WasmMetadata`、`ThreadCommand` 及 watch/`_rx` 链。
 - [x] **`shutdown()` 忽略返回值** → Thread 上报 panic、Process 上报 `wait()` 错误，`kill`/drain 为尽力（已注释原因）。
@@ -72,3 +72,17 @@
 - [x] **CI 覆盖各平台 + GUI crate** → `.github/workflows/ci.yml` 的 `test-matrix`：`ubuntu`/`macos`/`windows` 跑 `cargo test -p whitebox_core`，非 ubuntu 再跑 `cargo test -p whitebox-forge`（Slint GUI crate）。（仍待 CI 实跑确认。）
 - [x] **线程关闭端到端** → `tests/timeout.rs::shutdown_interrupts_spinning_guest`：死循环 guest + `shutdown()` 经 epoch 打断并返回。
 - [x] **进程 worker 链路端到端** → `tests/worker.rs::worker_process_runs_component`：真 worker 二进制 + `run_data` + `wait_output`（stdout 结果通道）。
+
+## 安全加固（评审修复）
+
+> 证据：`cargo check --workspace --all-targets` 零告警、`cargo test -p whitebox_core` 全绿。unix 代码本机（Windows）不编译，待 CI 验证。
+
+- [x] **线程回退不再对宿主施加不可逆 L1** → 回退线程删除 `apply_sandbox_with`；`chroot`/Landlock/rlimit/Job 等进程级原语不再作用于宿主，回退仅保留 L2（WASI），并打印明确警告。
+  - 说明：若将来需要线程回退的 L1，应改成显式 opt-in 且只施加可逆子集（当前不提供）。
+- [x] **worker stdout 捕获有上限** → `spawn_stdout_drain` 最多保留 8 MiB，超限继续排空但丢弃（防 guest 海量输出 OOM 宿主）。证据：`stdout_drain_truncates_at_cap`。
+- [x] **`--preopen-ro` 最小授权** → 不再全局 `deny_file_access=false`；改为 `readonly_fs=true` + 仅对每个 host 路径 `allow_fs_read`（L1 只放行白名单）。解析用 `rsplit_once(':')`（兼容 Windows 盘符），并校验 GUEST 非空、HOST 为绝对路径。
+- [x] **sockets 尊重 `SocketAddrUse`** → 出站（connect/send/receive）按端口策略；绑定仅放行端口 0 的隐式绑定；`Listen`/`Accept` 一律拒绝（禁止 guest 在宿主开监听）。证据：`socket_use_policy_only_allows_outbound`。
+- [x] **Landlock write-only 不再顺带授予读** → 路径规则按 `rule.read` 决定读位，write-only 不再拿到 `READ_FILE/READ_DIR`（`unix_common.rs`，待 CI 验证）。
+- [x] **`SandboxHandle` 丢弃即清理** → `runner: Option<Runner>` + `Drop`：未 `wait*`/`shutdown` 就丢弃时，Process `kill`+`wait`，Thread 置标志 + 单次轻推 epoch（回调按各自 flag 判定，不误杀并发）。
+- [x] **协议帧上限 + 入口预校验** → `read_bytes` 限 64 MiB（防 u32 长度致 4 GiB 分配）；`run_source` / worker `run_worker` 应用前 `validate`，冲突返回可诊断错误而非 panic。
+- [x] **Windows Job 多余句柄关闭** → `JOB_HANDLE` 已存在时 `CloseHandle` 本次新建的句柄，避免泄漏。

@@ -11,10 +11,11 @@
   - `_for_thread`：宿主线程回退，**异步**（`wasm_component_model_async` + `epoch_interruption`），`add_to_linker_async` + `Command::instantiate_async`，必须在调用方自己的 tokio runtime 内 await（禁止嵌套 runtime）。
 - **共享构件**：`build_linker(async_wasi)`（p2 WASI；无 host_func——组件 host 导入需 WIT 接口，未接）、`build_store(flag, &cfg, input)`（显式传本次配置建 `WasiCtx` + `ResourceTable` + Store；记录 Capture 管道句柄）、`load_wasm_bytes/load_from_wasm_file`（→ `component::Component`）。
 - **HostState（`WasiView`）**：`wasi: WasiCtx` + `table: ResourceTable` + `shutdown_requested_only_for_threadfallback: Arc<AtomicBool>` + `captured_stdout/stderr`。
-- **句柄收敛**：对外只有 `SandboxHandle { runner }`：
+- **句柄收敛**：对外只有 `SandboxHandle { runner: Option<Runner> }`（`Some` = 未消费）：
   - `wait()` / `wait_output()`（无界）、`wait_timeout` / `wait_output_timeout`（有界）；
   - `shutdown()`（有界：Thread 置标志 + 循环轻推 epoch；Process kill+wait）；
-  - Thread 侧用 `finished: Arc<AtomicBool>` 供有界等待轮询；Process 侧用 `spawn_stdout_drain` 排空并捕获 stdout。
+  - `Drop`：未 `wait*`/`shutdown` 就丢弃时尽力终止（Process kill+wait；Thread 置标志 + 单次 epoch）；`runner` 被取走后（正常结束）Drop 不再动作；
+  - Thread 侧用 `finished: Arc<AtomicBool>` 供有界等待轮询；Process 侧用 `spawn_stdout_drain` 排空并捕获 stdout（**上限 8 MiB**，超限继续排空但丢弃）。
 - **协议（三帧，全 postcard 序列化，无需版本号——父子同二进制）**：
   1. `WasmSource::{Path(PathBuf), Bytes(Vec<u8>)}`——路径 or 字节；
   2. 输入字节 `Vec<u8>`（已接线：`build_store` 用 `MemoryInputPipe` 喂 WASI stdin；空则按模式）；
@@ -27,6 +28,7 @@
 - **L1 失败不中止 / L2 失败必须终止**：进程沙箱尽力而为（能力不支持→`ApplyStatus::Error` 报告后继续）；WASI 配置失败（preopen 打不开等）→ `build_store` 返回错误 → worker 按 `Instantiate` 码退出 / 线程回退返回 Err。
 - **线程回退无法强制 kill**：Rust 线程无安全终止（`pthread_cancel`/`TerminateThread` 会撕裂 unwinding/锁/wasmtime 状态 = UB）。只靠 epoch 协作打断（wasm 代码卡死）+ 超时→abandon（宿主调用/`poll_oneoff` 长睡卡死，内存有界泄漏）。「硬杀」只在进程模式（`child.kill()`）。
   - 有界化：`wait_timeout`/`shutdown` 用 `finished` 标志轮询 + 到点**循环轻推 `increment_epoch`**（不依赖单次命中），超 `DEFAULT_SHUTDOWN_GRACE`（2s）仍不结束则 abandon 并返回错误。**超时是否返回不再依赖 epoch，但“真正终止线程内 guest”仍只能靠 epoch**（纯计算）；阻塞宿主调用两者都无解。
+  - **不施加 L1**：回退线程不调用 `apply_sandbox_with`——`chroot`/Landlock/rlimit/Job 是进程级且不可逆，施加到宿主会封死/误杀宿主；回退仅保留 L2（WASI），并打印明确警告。
 - **epoch vs fuel**：fuel（`Config::consume_fuel` + `store.set_fuel`，当前未启用）是确定性指令预算、自包含（无需外部轻推），但仍只在 wasm 指令边界扣——和 epoch 同类，打断不了阻塞宿主调用。
 - **三层有界停止（提议，见 TODO）**：`Store::call_hook`（**在 `#[cfg(feature="call-hook")]` 下**，我们未开该 feature；边界回调可读 HostState 并 trap）+ fuel（确定性预算）+ 协作/可取消宿主 API。关键边界：call-hook 只在"宿主调用/进出 wasm"边界生效，**打不断纯 wasm 长循环与已在进行的单个阻塞宿主调用**；后两者仍靠 epoch/fuel 与 async 取消/进程 kill。
 - **浏览器类比**：进程隔离靠 OS kill（`child.kill` ≈ 杀渲染进程）；进程内强终止 V8 靠 `TerminateExecution`（VM 级、可复位），wasmtime 等价物是 epoch 检查点 + call-hook 边界检查（后者未实现）。
@@ -54,7 +56,7 @@
 
 - `WasiStdio::{Inherit, Capture, Null}` → builder：`inherit_*` / `MemoryInputPipe`+`MemoryOutputPipe`（Capture 已接线：句柄存 `HostState`，run 后 `drain_captured` 取回并落回进程 stdout）/ `std::io::empty()`。
 - `wasi_preopens` → `preopened_dir(&host, &guest, FsPerms::{ReadOnly|ReadWrite})`，打开失败即报错（L2 fail-closed）。
-- `WasiSockets::{None, Allow(ports), Deny(ports), LoopbackOnly}` → `allow_tcp/udp` + `socket_addr_check(SocketAddr, SocketAddrUse)`。默认 `None`（全禁）；与 L1 `deny_network`/`network_ports` 求交（`validate`）。
+- `WasiSockets::{None, Allow(ports), Deny(ports), LoopbackOnly}` → `allow_tcp/udp` + `socket_addr_check(SocketAddr, SocketAddrUse)`。默认 `None`（全禁）；与 L1 `deny_network`/`network_ports` 求交（`validate`）。`socket_addr_check` 按 `SocketAddrUse` 区分：出站/收包按端口/回环策略；隐式临时绑定（端口 0）放行；显式固定端口绑定、`Listen`/`Accept` 一律拒绝（只授出站，不在宿主开监听）。
 - `wasi_ip_name_lookup: bool` → `allow_ip_name_lookup`（DNS）；与 `WasiSockets::None` / `deny_network` 互斥（`validate`）。默认 false。
 - `WasiClocks::{Host, Deterministic(seed)}` → `builder.wall_clock/monotonic_clock`（本地 `DeterministicWallClock`/`DeterministicMonotonicClock`）。默认 `Host`。
 - `WasiRandom::{Os, Seeded(seed)}` → 默认 `Os`：安全流 `wasi:random/random` = wasmtime 默认 `thread_rng()`（OS 播种 CSPRNG，真随机），非安全流 = `SmallRng`(OS 播种)。`Seeded` **只播种非安全流**（`insecure_random_seed` + `insecure_random(Deterministic)`，使 `wasi:random/insecure` 可复现），**不覆盖** `secure_random` → 安全流仍真随机（WASI 语义）。
@@ -70,6 +72,6 @@
 
 - sockets 的 **guest 级 e2e** 未做（需 `wasi:sockets` 资源句柄与地址结构，手写 WAT 成本高）；clocks/random 已有 guest 级 e2e（`tests/wasi_clocks.rs`、`tests/wasi_random.rs`），sockets 有 config 级 + 策略单测。
 - CPU：只有 epoch（中断）已接；fuel（确定性预算）与 cgroup `cpu.max`（速率）未接。
-- unix 平台已统一区分权限不足：`unix_common::SyscallOutcome`（`EACCES`/`EPERM`→`Denied`，其余→`Error`）；`linux.rs`/`macos.rs`/`android.rs` 经 `unix_common::status` 映射。**本地（Windows）编不到 unix 文件，待 CI 验证**。
+- unix 平台已统一区分权限不足：`unix_common::SyscallOutcome`（`EACCES`/`EPERM`→`Denied`，其余→`Error`）；`linux.rs`/`macos.rs`/`android.rs` 经 `unix_common::status` 映射。Landlock 路径规则按 `rule.read` 决定读位（write-only 不再隐式可读）。**本地（Windows）编不到 unix 文件，待 CI 验证**。
 - Linux/macOS 真机沙箱行为断言仍缺（CI `test-matrix` 已在真实 linux/macos 上编译+跑测试，可抓 unix 编译错误，但未断言 Landlock/seatbelt 实际 `Applied`/`Denied`）。
 - **不支持 p1 core module**：组件/p2-only，`wasi_snapshot_preview1` core module 在 `Component::new` 阶段即 `failed to parse WebAssembly module`；无运行期自动适配。wasmtime 提供两条桥（`p1` 特性的宿主适配层 / 构建期 preview1→preview2 adapter），但都需显式接。影响面 = 覆盖率（存量 p1），见 TODO。

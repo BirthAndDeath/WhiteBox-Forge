@@ -6,7 +6,7 @@
 ## 优先级排序（按「易 → 难 + 进度」，供排期；详细条目见下）
 
 - **P-A 快赢**（低难度、无前置，可立即做）：启用 `call-hook` feature；`DEFAULT_SHUTDOWN_GRACE` 可配；README/公开 API doc 示例；有界停止「边界写清」；`ResourceLimiter` 扩展（table/instances）；`log`/`tracing`；CI 加固（fmt/deny/MSRV）；abandon 线程计数上限。
-- **P-B 中等·高价值**（少量前置 / API 改动）：`validate()` 返 `Result`；`max_memory_bytes` 拆 L1/L2；**线程回退不可逆 L1（安全优先）**；CLI 暴露新面；能力/依赖静态提取 + 依赖/溯源；fuel 接入；`build_store` 注册 call_hook；线程路径 async 可取消；有界停止对照测试；property/fuzz；策略即代码+分层锁定；生命周期状态机；编译缓存目录保护 / GC；资源使用画像；防篡改哈希链；差异对比；错误类型统一。
+- **P-B 中等·高价值**（少量前置 / API 改动）：`validate()` 返 `Result`；`max_memory_bytes` 拆 L1/L2；CLI 暴露新面；能力/依赖静态提取 + 依赖/溯源；fuel 接入；`build_store` 注册 call_hook；线程路径 async 可取消；有界停止对照测试；property/fuzz；策略即代码+分层锁定；生命周期状态机；编译缓存目录保护 / GC；资源使用画像；防篡改哈希链；差异对比；错误类型统一。
 - **P-C 有前置**（需 guest 工具链 / 平台 / "包"抽象）：`input` 帧 e2e；sockets guest e2e；p1 构建期转换（运行期 p1 sync 路径已否决）；**组件 host 导入**（→ 凭据代理的前置）；真机 linux/macOS 行为断言（需 CI）；磁盘 I/O / 网络带宽配额；每包原子化 / `.wasm` 关联 / 原生快捷方式。
 - **P-D 大工程**（跨模块 / 平台重）：快照+回滚；结构化审计日志；凭据代理；拖拽安装+确认；恶意/漏洞模式识别；可选专用 AI 辅助层；microVM；TPM/keyring 签名；内存快照（不推荐）；「一次运行=可验证事务」总装。
 
@@ -24,12 +24,11 @@
 
 ### 正确性 / 安全（优先）
 
-- [ ] **线程回退仍对宿主进程施加不可逆 L1**：`lib.rs` 线程闭包 `apply_sandbox_with(&config)` 会 `chroot()`/Landlock/`prctl`/`unshare`，**不可撤销**，可能封死整个宿主（仅 `eprintln!` 警告）。
-  - 改：线程回退只施加**可逆**限制（rlimit），不可逆项跳过并在报告标 `Skipped`/`Denied`；或要求显式 opt-in。
 - [ ] **`max_memory_bytes` 一字段两用**：L1（Windows `JOB_OBJECT_LIMIT_JOB_MEMORY`，`sandbox/windows.rs`）与 L2（`StoreLimits`，`lib.rs::build_store`）。小值会让 Job 杀掉 wasmtime 自身。
   - 改：拆 `max_memory_bytes`(L2 wasm 堆) 与 `max_process_commit_bytes`(L1)，或 L1 = L2 + 余量。
-- [ ] **`validate()` 用 `assert!` panic**（`sandbox/mod.rs::setup_sandbox_with`）：配置错误是数据不应 panic。
-  - 改：`validate() -> Result<(), ConfigError>`，`run*`/`build_store` 前置校验返回 Err（fail-closed 且可控）。
+- [ ] **`validate()` 仍以 `assert!` 收尾**（`sandbox/mod.rs::setup_sandbox_with`）：配置错误是数据不应 panic。
+  - 现状：入口已预校验（`run_source` / worker `run_worker` 在应用沙箱前 `validate` 并返回可诊断错误），但 `setup_sandbox_with` 本身仍 `assert!`。
+  - 改：`validate() -> Result<(), ConfigError>`，`build_store` 前置校验返回 Err（fail-closed 且可控）。
 
 ### 能力完整性
 
@@ -74,7 +73,7 @@
 - [ ] **日志用 `eprintln!`**：换 `log`/`tracing` 便于宿主集成与分级。
 - [ ] **`DEFAULT_SHUTDOWN_GRACE` 硬编码 2s**（`lib.rs`）：超时语义应可配。
 
-> 建议顺序：线程回退不可逆 L1 → fuel → `max_memory_bytes` 拆分 → `validate` 返 `Result`；其余按需求排。
+> 建议顺序：fuel → `max_memory_bytes` 拆分 → `validate` 返 `Result`；其余按需求排。
 
 ## 候选特性（提案，未排期）
 
