@@ -17,31 +17,11 @@ rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.53.2", features = ["macros"] }
-# 启用 `cache`（编译缓存）：缓存目录由 `dir::tmp_dir()` 提供，运行时不可用则自动禁用。
-# 注意 zstd 栈的 advisory：升级/启用时用 `cargo update -p zstd -p zstd-safe -p zstd-sys`
-# 并跑 `cargo deny check advisories` 确认解析版本均为 patched。
-# Enable `cache` (compile cache): the directory comes from `dir::tmp_dir()` and is disabled
-# at runtime if unavailable. Mind the zstd advisory stack: update zstd/zstd-safe/zstd-sys
-# and run `cargo deny check advisories` to confirm patched versions before shipping.
-# 其余与 wasmtime 49 默认特性集一致（含 cache；已对 49.0.5 核对）。
-wasmtime = { version = "49.0.2", default-features = false, features = [
-    "anyhow", "async", "backtrace", "cache", "gc", "gc-copying", "gc-drc", "gc-null",
-    "wat", "profiling", "parallel-compilation", "cranelift", "pooling-allocator",
-    "demangle", "addr2line", "coredump", "debug-builtins", "runtime",
-    "component-model", "component-model-async", "threads", "stack-switching",
-    "std", "debug", "compile-time-builtins", "wit-parser",
-] }
-wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p2"] }
-
-# `directories` 仅用于桌面平台的自身目录定位；移动端（Android/iOS）暂不引入，
-# 由 `dir::get_dir` 的 `todo!()` 占位。
-# `directories` is only used for desktop directory resolution; mobile (Android/iOS) does
-# not pull it in yet and `dir::get_dir` uses `todo!()` there.
-[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-directories = "6.0.0"
+wasmtime = { version = "50.0.1", features = ["cache"] }
+wasmtime-wasi = "49.0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
