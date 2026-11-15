@@ -29,6 +29,9 @@
 - [ ] **`validate()` 仍以 `assert!` 收尾**（`sandbox/mod.rs::setup_sandbox_with`）：配置错误是数据不应 panic。
   - 现状：入口已预校验（`run_source` / worker `run_worker` 在应用沙箱前 `validate` 并返回可诊断错误），但 `setup_sandbox_with` 本身仍 `assert!`。
   - 改：`validate() -> Result<(), ConfigError>`，`build_store` 前置校验返回 Err（fail-closed 且可控）。
+- [ ] **线程回退的降级显性化**（安全审查建议）：spawn 失败回退线程时 guest 以宿主内存+凭据、仅 L2 运行（`lib.rs:1064,1097`）；目前仅 `eprintln` 警告，库嵌入（GUI）场景可能不可见。改：`fallback = thread | refuse` 显式开关（`refuse` 时报错退出，fail-closed）＋库接口给出回退通知（回调/返回值），不只靠 stderr。
+- [ ] **`caching.directory` 在非 portable Windows 不套 `protect_dir`**（`sandbox/mod.rs::enable_compile_cache_at`）：目录 ACL 继承父级，缓存中毒纵深弱于 Unix。改：非 portable Windows 也按需 TreeSet 收紧（成本考量后取舍）。
+- [ ] **`set_compile_cache_dir` 首次生效且静默**（`lib.rs:62-64`）：长驻宿主先后用不同缓存目录时，后者被静默忽略。改：重复设置直接报错，或至少可诊断日志。
 
 ### 能力完整性
 
@@ -54,6 +57,8 @@
 - [ ] **异步可取消（线程路径）**：`add_to_linker_async` + 把 `Command::instantiate_async`/`call_run` 放进 `tokio::select!`（对关闭/超时定时器），使 WASI 阻塞调用可随 future drop 取消。
 - [ ] **边界写清（注释/文档）**：call-hook 只在宿主调用/进出 wasm 边界检查，**打断不了纯 wasm 长循环**（仍须 epoch/fuel），也**打断不了已在进行的单个阻塞宿主调用**（须 async 取消或进程 kill）。
 - [ ] **测试**：guest 反复调宿主 → call-hook 无 epoch 即停止；guest 纯长循环 → fuel 停止（与 epoch 路径对照）。
+
+> **设计思路（记，未排期）**：线程回退「关宿主=关线程」——无法进程隔离时把宿主当隔离边界，需要硬杀就把宿主进程整个退出。判断：仅在**宿主是专用的可丢弃一次性加载器**时成立（此时等价于现有 `Runner::Process` 的 `kill()`）；库嵌入/长驻宿主下无差别破坏，且硬杀会丢掉 `wait_output` 捕获与 `WorkerExit` 阶段码。更一致的落点是把回退做成显式模式 `fallback = thread | refuse`：`refuse` 时 spawn 失败即报错退出（fail-closed、无静默降级，即「关宿主」的安全形态）；`thread` 保持现协作打断+abandon。如需 CLI 侧确定性硬杀可加 `--thread-overrun=exit`（`process::exit`），明确标注代价，不作默认。
 
 ### 工程 / 测试
 
@@ -94,13 +99,34 @@
 
 ### 编译缓存
 
-- [ ] **编译缓存目录保护（防缓存中毒）**：wasmtime `Config::cache` 目录做权限/完整性保护（低权/guest 不可写）+ 校验和/签名（README 已提"guard against cache poisoning"）。
+- [ ] **编译缓存完整性（防缓存中毒）**：权限层已落地（每用户 `cache_dir()/wasmtime`；Unix `protect_dir` 0700，Windows 每用户 ACL）；剩余：内容校验/签名（或确认 wasmtime 缓存内部校验足够）。
 - [ ] **删除无引用编译缓存**：编译缓存 GC——按引用计数/可达性清理孤儿条目（模块/组件已不再引用）。
+
+### 日志 / 输出
+
+- [ ] **stdout 输出策略**：CLI 目前只捕获、不写宿主；待决定是否输出，以及是否做 TTY 转义/重定向。
+- [ ] **日志配额扩展**：单文件上限 / 保留天数已可配（`logging.json`）；仍**没有**每日文件数/总大小上限，可加 `max_files_per_day` 或总配额。
 
 ### 供应链 / 包管理
 
 - [ ] **TPM / OS keyring 签名验证全部包管理内容**：用 TPM（TSS）或系统 keyring（Windows DPAPI、macOS Keychain、Linux libsecret）做密钥托管与签名校验，覆盖"全部包内容"防篡改。
 - [ ] **每包目录的原子化操作**：每个包的安装/更新以原子方式落盘（临时目录写入 + rename 交换），失败可回滚、杜绝半状态。
+
+#### OCI / WASM 分发与验签（crate 观望，未采用）
+
+> 以下仅登记，**未来成熟后再考虑引入**；当前不加入依赖（避免未稳 API 与依赖面扩大）。
+> 关联：若后续引入 `libp2p`，需先解决其 `libp2p-swarm 0.48.0` 对 `wasm-bindgen-futures =0.4.58`（`js-sys =0.3.85`）与 Slint/glow（`js-sys ~0.3.100`）同一 `0.3.x` 兼容线的冲突；当前已移除未使用的 `libp2p`。
+
+| 用途 | crate | 说明 | 维护方 | 评估 |
+| --- | --- | --- | --- | --- |
+| 传输 | `oci-client` | 与 OCI Registry 交互：拉取/推送 manifest、按 digest 取 blob | ORAS 项目（CNCF 相关） | 活跃开发，健康度优秀，事实基础设施 |
+| WASM 封装 | `oci-wasm` | `oci-client` 的薄封装，补 `application/wasm` 媒体类型 | Bytecode Alliance 托管 | 逻辑简单，有组织兜底 |
+| 类型定义 | `oci-spec` | OCI Image/Distribution/Runtime 规范的 Rust 类型 | youki 项目维护者 | 下载量大、被广泛依赖，类型层事实稳定 |
+| 验签（官方对齐） | `sigstore` | Sigstore/Cosign 的 Rust 绑定，支持 OCI Artifact 验签 | Sigstore 官方 | 组织稳定，但 API 明确标注实验性、1.0 前可能变 |
+| 验签（本地文件） | `sigstore-verification` | 仅验证本地文件的 Cosign/SLSA 签名 | 个人（mise 作者 jdx） | 被 mise 生产使用；OCI 直接拉取验签尚未实现（Planned） |
+| WASM 包管理 | `wasm-pkg-client` | 拉取/发布 WASM 组件，管理 WIT 依赖（wkg 的库形态） | Bytecode Alliance | API 仍在演进，适合需要 WIT 依赖解析时用 |
+
+- [ ] **观望项**：待上述 crate 的 API/版本稳定后再评估；建议顺序 `oci-spec`（纯类型）→ `oci-client`/`oci-wasm` → 验签/包管理。
 
 ### 系统集成
 

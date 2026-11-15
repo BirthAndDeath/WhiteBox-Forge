@@ -1,0 +1,5 @@
+{
+  "timeout_ms": null,
+  "shutdown_grace_ms": 2000,
+  "poll_ms": 20
+}

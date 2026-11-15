@@ -17,12 +17,13 @@
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, CloseHandle, GetLastError, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_TIME,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOBOBJECT_SECURITY_LIMIT_INFORMATION,
+    JOB_OBJECT_SECURITY_NO_ADMIN, JobObjectExtendedLimitInformation,
+    JobObjectSecurityLimitInformation, SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, ProcessSignaturePolicy, ProcessStrictHandleCheckPolicy,
@@ -33,32 +34,24 @@ use super::SandboxCapability::{
     MaxChildren, MaxCpuTime, MaxMemory, MsSignedOnly, NoExec, NoNewPrivileges, NoWin32k,
     StrictHandles,
 };
-use super::{CapabilityReport, ReportSet, SandboxConfig, outcome};
+use super::{CapabilityReport, ReportSet, SandboxConfig, denied, outcome};
 
-// JobObjectSecurityLimitInformation = 6（Win8+ 的未文档化信息类，windows-sys 未导出）
-const JOBOBJECT_INFO_SECURITY_LIMITS: i32 = 6;
-// JOB_OBJECT_SECURITY_NO_ADMIN = 0x00000008
-const JOB_OBJECT_SECURITY_NO_ADMIN: u32 = 0x0000_0008;
 // PROCESS_MITIGATION_* 策略的位元（windows-sys 0.59 未导出命名常量，按 SDK 定义手写）
 const MITIGATION_DISALLOW_WIN32K_SYSTEM_CALLS: u32 = 0x1;
 const MITIGATION_MICROSOFT_SIGNED_ONLY: u32 = 0x1;
 const MITIGATION_RAISE_EXCEPTIONS_ON_INVALID_HANDLE: u32 = 0x1;
 
-/// 与 SDK 中 JOBOBJECT_SECURITY_LIMIT_INFORMATION 一致的布局
-#[repr(C)]
-struct JobObjectSecurityLimit {
-    security_limit_flags: u32,
-    job_token: HANDLE,
-    permissions_to_grant: u32,
-    permissions_to_deny: u32,
-}
-
 /// 全局持有的 Job 句柄（usize 形式，进程结束前不关闭）
 static JOB_HANDLE: OnceLock<usize> = OnceLock::new();
+/// 当前进程是否已成功加入 Job（避免重复 `AssignProcessToJobObject`）。
+/// Whether the current process was already assigned to the job (avoid re-assigning).
+static JOB_ASSIGNED: OnceLock<()> = OnceLock::new();
 
 /// 当前进程在某项 Job 限制上的应用结果
 struct JobGuard {
     no_new_privileges: bool,
+    /// `no_new_privileges` 请求了但被拒绝（权限不足，如管理员进程）
+    no_new_privileges_denied: bool,
     active_process_limit: bool,
     max_memory: bool,
     max_cpu_time: bool,
@@ -83,10 +76,15 @@ pub(super) fn setup(config: &SandboxConfig) -> Vec<CapabilityReport> {
     )
     .override_status(
         NoNewPrivileges,
-        outcome(
-            config.no_new_privileges,
-            job.as_ref().is_some_and(|j| j.no_new_privileges),
-        ),
+        if config.no_new_privileges && job.as_ref().is_some_and(|j| j.no_new_privileges_denied) {
+            // 平台支持但权限不足（管理员进程无法施加 NO_ADMIN），与“不支持”区分
+            denied(true)
+        } else {
+            outcome(
+                config.no_new_privileges,
+                job.as_ref().is_some_and(|j| j.no_new_privileges),
+            )
+        },
     )
     .override_status(
         MaxMemory,
@@ -164,10 +162,16 @@ fn create_job(config: &SandboxConfig) -> Option<JobGuard> {
     if created.is_null() {
         return None;
     }
-    let handle = *JOB_HANDLE.get_or_init(|| created as usize) as HANDLE;
+    let handle_usize = *JOB_HANDLE.get_or_init(|| created as usize);
+    let handle = handle_usize as HANDLE;
+    if handle_usize != created as usize {
+        // 已有全局 Job：本次新建的句柄无用途，立即关闭避免泄漏
+        unsafe { CloseHandle(created) };
+    }
 
     let mut guard = JobGuard {
         no_new_privileges: false,
+        no_new_privileges_denied: false,
         active_process_limit: false,
         max_memory: false,
         max_cpu_time: false,
@@ -176,11 +180,16 @@ fn create_job(config: &SandboxConfig) -> Option<JobGuard> {
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     let mut flags: u32 = 0;
 
-    // 活动进程数：deny_exec → 1，否则 max_children
+    // 活动进程数：Job 的 ActiveProcessLimit 包含当前进程，故 max_children=N 需设 N+1。
+    // deny_exec → 1（仅当前进程，不能再派生）。
+    // ActiveProcessLimit counts the current process, so N children means N+1.
     let active_limit = if config.deny_exec {
         1
     } else {
-        config.max_children.unwrap_or(0)
+        config
+            .max_children
+            .map(|n| n.saturating_add(1))
+            .unwrap_or(0)
     };
     if config.deny_exec || config.max_children.is_some() {
         flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
@@ -189,15 +198,22 @@ fn create_job(config: &SandboxConfig) -> Option<JobGuard> {
         guard.active_process_limit = true;
     }
     if let Some(bytes) = config.max_memory_bytes {
-        flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
-        info.JobMemoryLimit = bytes as usize;
-        guard.max_memory = true;
+        // 32 位目标上超出 usize 时不设限制 → 报告 Error（fail-closed）。
+        // On 32-bit, leave the limit unset on overflow so it is reported as Error.
+        if let Ok(bytes) = usize::try_from(bytes) {
+            flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            info.JobMemoryLimit = bytes;
+            guard.max_memory = true;
+        }
     }
     if let Some(ms) = config.max_cpu_ms {
-        flags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
-        // 时间单位是 100ns，1ms = 10000
-        info.BasicLimitInformation.PerProcessUserTimeLimit = ms as i64 * 10_000;
-        guard.max_cpu_time = true;
+        // 时间单位是 100ns（1ms = 10000）。溢出则不设该限制 → 报告 Error（fail-closed）。
+        // 100ns ticks; on overflow leave the limit unset so it is reported as Error.
+        if let Some(ticks) = ms.checked_mul(10_000).and_then(|v| i64::try_from(v).ok()) {
+            flags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
+            info.BasicLimitInformation.PerProcessUserTimeLimit = ticks;
+            guard.max_cpu_time = true;
+        }
     }
     if flags != 0 {
         info.BasicLimitInformation.LimitFlags = flags;
@@ -215,26 +231,34 @@ fn create_job(config: &SandboxConfig) -> Option<JobGuard> {
     }
 
     if config.no_new_privileges {
-        let security = JobObjectSecurityLimit {
-            security_limit_flags: JOB_OBJECT_SECURITY_NO_ADMIN,
-            job_token: std::ptr::null_mut(),
-            permissions_to_grant: 0,
-            permissions_to_deny: 0,
+        // 直接用 SDK 布局：错误的结构体/信息类/标志位会让该能力静默失效。
+        // Use the SDK layout directly; a wrong struct/class/flag silently disables this.
+        let security = JOBOBJECT_SECURITY_LIMIT_INFORMATION {
+            SecurityLimitFlags: JOB_OBJECT_SECURITY_NO_ADMIN,
+            JobToken: std::ptr::null_mut(),
+            SidsToDisable: std::ptr::null_mut(),
+            PrivilegesToDelete: std::ptr::null_mut(),
+            RestrictedSids: std::ptr::null_mut(),
         };
         let ok = unsafe {
             SetInformationJobObject(
                 handle,
-                JOBOBJECT_INFO_SECURITY_LIMITS,
+                JobObjectSecurityLimitInformation,
                 &security as *const _ as *const c_void,
-                std::mem::size_of::<JobObjectSecurityLimit>() as u32,
+                std::mem::size_of::<JOBOBJECT_SECURITY_LIMIT_INFORMATION>() as u32,
             )
         } != 0;
         guard.no_new_privileges = ok;
+        if !ok {
+            guard.no_new_privileges_denied = unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
     }
 
-    let assigned = unsafe { AssignProcessToJobObject(handle, GetCurrentProcess()) } != 0;
-    if !assigned {
-        return None;
+    if JOB_ASSIGNED.get().is_none() {
+        if unsafe { AssignProcessToJobObject(handle, GetCurrentProcess()) } == 0 {
+            return None;
+        }
+        let _ = JOB_ASSIGNED.set(());
     }
 
     Some(guard)

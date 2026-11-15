@@ -15,11 +15,17 @@ anyhow = "1.0.104"
 postcard = { version = "1.1", features = ["use-std"] }
 rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1.53.2", features = ["macros"] }
-# 关闭默认特性以剔除 `cache`（其 zstd 依赖有未修复 advisory；且我们尚未启用编译缓存）。
-# 其余与 wasmtime 49 默认特性集一致（defaults minus cache）。
+# 启用 `cache`（编译缓存）：缓存目录由 `dir::tmp_dir()` 提供，运行时不可用则自动禁用。
+# 注意 zstd 栈的 advisory：升级/启用时用 `cargo update -p zstd -p zstd-safe -p zstd-sys`
+# 并跑 `cargo deny check advisories` 确认解析版本均为 patched。
+# Enable `cache` (compile cache): the directory comes from `dir::tmp_dir()` and is disabled
+# at runtime if unavailable. Mind the zstd advisory stack: update zstd/zstd-safe/zstd-sys
+# and run `cargo deny check advisories` to confirm patched versions before shipping.
+# 其余与 wasmtime 49 默认特性集一致（含 cache；已对 49.0.5 核对）。
 wasmtime = { version = "49.0.2", default-features = false, features = [
-    "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null",
+    "anyhow", "async", "backtrace", "cache", "gc", "gc-copying", "gc-drc", "gc-null",
     "wat", "profiling", "parallel-compilation", "cranelift", "pooling-allocator",
     "demangle", "addr2line", "coredump", "debug-builtins", "runtime",
     "component-model", "component-model-async", "threads", "stack-switching",

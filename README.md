@@ -54,8 +54,14 @@ Key design decisions:
 
 关键设计决策：
 
-- A single global `wasmtime::Engine` is lazily initialized and shared across sandboxes. Compilation caching is planned, with care taken to guard against cache poisoning.
-- 一个全局的 `wasmtime::Engine` 被惰性初始化并在沙箱间共享。计划加入编译缓存，同时注意防范缓存中毒。
+- A single global `wasmtime::Engine` is lazily initialized and shared across sandboxes. The compile cache is enabled per-user (`<cache_dir>/wasmtime`, tightened to owner-only on Unix), with care taken to guard against cache poisoning.
+- 一个全局的 `wasmtime::Engine` 被惰性初始化并在沙箱间共享。编译缓存已启用（每用户 `<cache_dir>/wasmtime`，Unix 上收紧为属主专用），并注意防范缓存中毒。
+
+- Worker stderr is escaped and appended asynchronously to `<cache_dir>/worker-<UTC day>.log` (1 MiB rotation, 7-day retention). Guest stderr is discarded; guest stdout is captured but currently not emitted by the CLI.
+- worker stderr 经转义后异步写入 `<cache_dir>/worker-<UTC day>.log`（单文件 1 MiB 轮换、保留 7 天）；guest stderr 丢弃，guest stdout 仅捕获、CLI 暂不输出。
+
+- User-tunable settings are loaded as JSON from `config_dir()` (`run`/`limits`/`logging`/`caching`, templates in `config/`): missing files fall back to built-in defaults, malformed files fail closed. Security-relevant grants stay code/CLI-only (deny-by-default).
+- 用户可调项以 JSON 从 `config_dir()` 加载（`run`/`limits`/`logging`/`caching`，模板见仓库 `config/`）：文件缺失用内置默认，文件存在但非法则拒绝启动（fail-closed），安全授出仍只走代码/CLI（deny-by-default）。
 
 - Each sandbox is spawned as a fresh worker process by re-executing the current binary with the `__WASM_WORKER=1` environment variable and a cleared environment. This keeps hostile modules out of the host process. If process creation fails, execution falls back to a thread.
 - 每个沙箱通过重新执行当前二进制（设置 `__WASM_WORKER=1` 环境变量并清空其余环境）来启动一个全新的 worker 进程，让不受信任的模块无法影响宿主进程。若进程创建失败，则回退为线程执行。

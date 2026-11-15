@@ -39,3 +39,30 @@ Code Rules:
 License: Apache 2.0 (see LICENSE file in the repository).
 
 许可证：Apache 2.0（详见仓库中的 LICENSE 文件）
+
+## 构建环境 / Build environment
+
+### Windows：MSVC 14.52 下 zstd-sys 等 C 依赖编译失败（D8050）
+
+- 现象：`cargo check/build` 编译 `zstd-sys`（wasmtime `cache` 特性引入）时，`cl.exe -Brepro` 报
+  `命令行 error D8050：无法执行 c1.dll：未能将命令行放入调试记录中`，且**每个文件**都失败。
+  裸 `cl.exe -Brepro` 手动重放同一命令成功，`-j1` 无效——是 VS 18 / MSVC 14.52 工具链与
+  cc-rs 的 `/Brepro` 调用形态的交互缺陷，与仓库代码无关。
+- 解决：安装 Visual Studio 的 **C++ Clang tools for Windows** 组件（`VC\Tools\Llvm`），
+  每次构建前把 C/C++ 编译器指到 `clang-cl.exe`（Rust 链接仍是默认 MSVC）：
+
+  ```powershell
+  # 自动定位 VS 的 LLVM 组件，无需硬编码版本路径
+  $llvm = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter clang-cl.exe -ErrorAction SilentlyContinue |
+          Where-Object { $_.FullName -match '\\VC\\Tools\\Llvm\\[^\\]+\\bin\\' } |
+          Select-Object -First 1 -ExpandProperty FullName
+  $env:CC_x86_64_pc_windows_msvc = $llvm
+  $env:CXX_x86_64_pc_windows_msvc = $llvm
+  cargo check --workspace --all-targets
+  ```
+
+  该环境变量只影响 cc-rs 构建的 C/C++ 依赖（zstd-sys 等），Rust 代码无影响；
+  CI（ubuntu/macos）不需要。
+
+- 相关本地怪癖：本工作站的测试二进制进程对 `%TEMP%` 写入被环境（AV/宿主沙箱）拒绝，
+  单元测试用 `CARGO_TARGET_TMPDIR` 代替 `std::env::temp_dir()`；详见 `memory.md` 踩坑记录 10/11。

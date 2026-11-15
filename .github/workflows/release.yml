@@ -1,0 +1,199 @@
+name: release
+
+# 打 tag（v*）时构建三平台产物并发布 Release；手动触发只上传 artifacts。
+# On v* tags, build packages for all three desktops and publish a Release; manual runs
+# only upload artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  security:
+    name: security gate (advisories/bans/sources)
+    # 构建前先过依赖安全门禁：存在 RustSec 漏洞 / yanked / 未知来源时直接失败，
+    # build 不会运行 → 不产生任何构建产物。
+    # Fail closed before building: known advisories / yanked / unknown sources abort the
+    # workflow, so the build job (and its artifacts) never run.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: advisories bans sources
+
+  verify:
+    name: verify (check + test)
+    # 编译/测试门禁：确保 tag 指向的提交可编译、核心测试通过；失败则 build 不运行。
+    # Build/test gate: the tagged commit must compile and pass core tests; otherwise the
+    # build job (and its artifacts) never run.
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install Linux build dependencies (Slint)
+        uses: ./.github/actions/slint-linux-deps
+
+      - name: cargo check (workspace, all targets)
+        run: cargo check --locked --workspace --all-targets
+
+      - name: cargo test -p whitebox_core
+        run: cargo test --locked -p whitebox_core
+
+  build:
+    name: package (${{ matrix.os }})
+    needs: [security, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install Linux build dependencies (Slint)
+        # Slint 在 Linux 上构建需要 fontconfig/freetype/xkbcommon/GL 等开发包。
+        # Slint needs fontconfig/freetype/xkbcommon/GL dev packages on Linux.
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/slint-linux-deps
+
+      - name: cargo build --release
+        run: cargo build --release --locked -p whitebox-forge
+
+      - name: smoke test (--help)
+        # 产物必须可执行：--help 在 init() 之后由 clap 直接退出。
+        # The artifact must be runnable: --help exits right after init() in clap.
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/release/whitebox-forge
+          if [[ "${{ runner.os }}" == "Windows" ]]; then bin="$bin.exe"; fi
+          "$bin" --help > /dev/null
+
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/whitebox-forge dist/
+          cp README.md LICENSE dist/
+          tar -czf "whitebox-forge-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz" -C dist .
+
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/whitebox-forge.exe dist/
+          Copy-Item README.md, LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath "whitebox-forge-$env:RUNNER_OS-$env:RUNNER_ARCH.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whitebox-forge-${{ runner.os }}-${{ runner.arch }}
+          path: whitebox-forge-*
+          if-no-files-found: error
+          # 若有任一平台失败，cleanup job 会删除本次 run 的全部 artifacts；
+          # 1 天保留期是 cleanup 自身失败时的兜底。
+          # If any platform fails, the cleanup job deletes this run's artifacts; a 1-day
+          # retention is a fallback in case cleanup itself fails.
+          retention-days: 1
+
+  release:
+    name: publish
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    # 只有发布这一步需要写权限；build 仅读。
+    # Only the publish step needs write access; build is read-only.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+          # 平台产物缺任一即失败（配合下方完整性断言，双重兜底）。
+          # Fail if any expected artifact is missing (backed by the completeness check below).
+          if-no-files-found: error
+
+      - name: check artifact completeness (all platforms)
+        # 防“Re-run failed jobs”发布残缺 Release：cleanup 在失败时删除了全部 artifacts，
+        # 重跑只重建失败的 leg，成功 leg 的产物不会重新上传。下载后断言三大平台都在，
+        # 缺任一即中止发布（避免整体为绿色却只发布部分平台的二进制）。
+        # Guard against publishing a partial release after "Re-run failed jobs": cleanup
+        # deletes all artifacts on failure, and a re-run only rebuilds the failed leg. After
+        # download, assert all three platforms are present; abort otherwise instead of
+        # shipping a green run with a subset of the binaries.
+        shell: bash
+        run: |
+          set -euo pipefail
+          files="$(ls dist/)"
+          for os in linux macos windows; do
+            if ! printf '%s\n' "$files" | grep -iq "whitebox-forge-${os}"; then
+              echo "::error::missing ${os} artifact; re-run failed jobs does not rebuild the successful legs' artifacts deleted by cleanup"
+              exit 1
+            fi
+          done
+          echo "all three platform artifacts present"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  cleanup:
+    name: cleanup artifacts (failure)
+    # 任一前置 job 失败 → 删除本次 run 的所有 workflow artifacts（“零 artifacts”）。
+    # 注意：GitHub Release 的 assets 不在此删除（避免重跑时误删既有 Release）；
+    # 若 release job 部分上传后失败，需要人工清理或改为 draft→publish 两阶段。
+    # If any prerequisite fails, delete all workflow artifacts for this run. GitHub Release
+    # assets are not touched (to avoid deleting an existing release on a re-run); a partial
+    # release requires manual cleanup or a draft→publish two-phase flow.
+    if: failure()
+    needs: [security, verify, build, release]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: delete workflow artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.runId,
+              }
+            );
+            for (const artifact of artifacts) {
+              core.info(`deleting artifact ${artifact.name} (${artifact.id})`);
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id,
+              });
+            }

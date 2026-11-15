@@ -1,0 +1,20 @@
+name: slint-linux-deps
+description: Install Linux system dependencies required to build Slint (verify + release)
+runs:
+  using: composite
+  steps:
+    - name: apt install
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          libfontconfig1-dev \
+          libfreetype-dev \
+          libxkbcommon-dev \
+          libxkbcommon-x11-dev \
+          libgl1-mesa-dev \
+          libegl1-mesa-dev \
+          libx11-dev \
+          libxcb1-dev \
+          libwayland-dev

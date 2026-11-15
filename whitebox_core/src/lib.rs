@@ -1,37 +1,118 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use std::{path::Path, sync::LazyLock};
-use tokio::sync::watch;
 use wasmtime::*;
+use wasmtime_wasi::sockets::SocketAddrUse;
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 pub mod sandbox;
+// 目录模块的根文件是 `dir/dir.rs`，其子模块用显式 `#[path]` 指向同目录文件。
+// The `dir` module root is `dir/dir.rs`; its submodules point at sibling files via `#[path]`.
+#[path = "dir/dir.rs"]
+pub mod dir;
+pub mod config;
+mod worker_log;
 use sandbox::*;
+
+/// 集成测试专用钩子（仅 `debug_assertions`；release 编译掉）。
+///
+/// 取代原先的会话级环境变量开关：`std::env::set_var` 在 edition 2024 为 `unsafe`，
+/// 且同一测试二进制内并行测试对 env 的读写存在数据竞争。这里改用进程内全局开关
+/// （原子 / `Mutex`），串行、并行都无 UB。
+#[cfg(debug_assertions)]
+pub mod test_hooks {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FORCE_THREAD_FALLBACK: AtomicBool = AtomicBool::new(false);
+    static WORKER_EXE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    /// 强制 `run*` 走线程回退（跳过进程 spawn），用于测试线程回退路径。
+    pub fn force_thread_fallback(enabled: bool) {
+        FORCE_THREAD_FALLBACK.store(enabled, Ordering::SeqCst);
+    }
+
+    /// 覆盖 worker 可执行文件路径（集成测试指向真正的 worker 二进制以验证进程链路）。
+    pub fn worker_exe(path: Option<PathBuf>) {
+        *WORKER_EXE.lock().unwrap() = path;
+    }
+
+    pub(crate) fn thread_fallback_forced() -> bool {
+        FORCE_THREAD_FALLBACK.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn worker_exe_override() -> Option<PathBuf> {
+        WORKER_EXE.lock().unwrap().clone()
+    }
+}
 
 //全局初始化引擎，考虑配置编译缓存，但是需要小心缓存中毒，需要考虑路径保护，喵！
 static ENGINE: LazyLock<Engine> =
     LazyLock::new(|| Engine::new(&get_engine_config()).expect("failed to init wasmtime engine"));
 //懒加载，在init初始化后才应该被读取
 static IS_WORKER: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+/// 宿主解析的编译缓存目录；必须在 `ENGINE` 首次初始化前设置（全局引擎只初始化一次）。
+/// Host-resolved compile-cache dir; must be set before the first `ENGINE` init (the engine
+/// is global and initialized once).
+static COMPILE_CACHE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// 记录本次运行的编译缓存目录（首次设置生效，与全局引擎一致）。
+/// Record the compile-cache dir for this run (first set wins, matching the global engine).
+fn set_compile_cache_dir(dir: Option<PathBuf>) {
+    let _ = COMPILE_CACHE_DIR.set(dir);
+}
 
 fn get_engine_config() -> wasmtime::Config {
     let mut config = Config::new();
-    if IS_WORKER
+    // 未 init 时按非 worker 处理（不再 panic）；公开入口会用 require_init 提前报错。
+    let is_worker = IS_WORKER
         .get()
-        .expect("you must call init function first!")
-        .as_ref()
-        .load(Ordering::SeqCst)
-    {
-        //在worker模式中，则已进入进程，无需线程回退的异步协作模式，因为异步协作有性能损耗
-        config
+        .map(|flag| flag.load(Ordering::SeqCst))
+        .unwrap_or(false);
+    if is_worker {
+        //在worker模式中，则已进入进程，无需线程回退的异步协作模式，因为异步协作有性能损耗。
+        // 但组件模型（p2）是硬要求，显式开启避免依赖默认值。
+        config.wasm_component_model(true);
     } else {
         config.wasm_component_model_async(true);
         //config.consume_fuel(true);
         config.wasm_component_model(true);
-        // epoch 打断已启用（线程回落关闭用）。必须配 load_module 在 instantiate_async 之前
+        // epoch 打断已启用（线程回落关闭用）。必须配 load_component_for_thread 在实例化之前
         // 设置 deadline+callback，否则默认 deadline=0 + 回调未注册会直接 Trap::Interrupt。
         config.epoch_interruption(true);
-        config
     }
+    attach_compile_cache(&mut config);
+    config
+}
+
+/// 启用 wasmtime 编译缓存：仅当宿主解析出可用目录时；失败则保持禁用。
+///
+/// 缓存是纯优化，不影响正确性/安全；因此这里 best-effort：目录不存在/`Cache::new`
+/// 失败都只是不启用，不阻断启动。目录由 [`SandboxConfig::enable_compile_cache`] 在宿主侧
+/// 解析（每用户 cache 目录；portable 为 `<exe_dir>/cache`）并随配置传到 worker。
+/// Enable the wasmtime compile cache only when the host resolved a usable directory;
+/// failures leave it disabled. The cache is a pure optimization, so this is best-effort and
+/// never blocks startup. The directory is resolved host-side by
+/// `SandboxConfig::enable_compile_cache` (per-user cache dir; portable `<exe_dir>/cache`)
+/// and carried to the worker in the config.
+fn attach_compile_cache(config: &mut wasmtime::Config) {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if let Some(dir) = COMPILE_CACHE_DIR.get().and_then(|d| d.as_ref()) {
+        // 目录由宿主侧 `enable_compile_cache` 创建，且 L1 白名单已允许其读写。
+        // The dir is created host-side by `enable_compile_cache`; L1 already allows it.
+        if dir.is_dir() {
+            let mut cache_config = wasmtime::CacheConfig::new();
+            // `with_directory` 要求绝对路径；宿主解析出的路径已是绝对路径。
+            cache_config.with_directory(dir.as_path());
+            if let Ok(cache) = wasmtime::Cache::new(cache_config) {
+                config.cache(Some(cache));
+            }
+        }
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let _ = config;
 }
 //！用于确定全局状态，因此必须在一切core函数运行前运行！！喵！MIAO!
 
@@ -156,20 +237,37 @@ fn run_worker() -> Result<(), WorkerError> {
             }
         }
     };
+    // 配置冲突（如 deny_network 与 sockets 越权）必须在落盘前拒绝：
+    // 否则 `apply_sandbox` 里的 assert! 会 panic，把配置错误变成不可诊断的崩溃。
+    let violations = wasi_config.validate();
+    if !violations.is_empty() {
+        return Err(WorkerError::new(
+            WorkerExit::Decode,
+            anyhow::anyhow!("沙箱配置冲突：{}", violations.join("；")),
+        ));
+    }
+    // 在应用沙箱与首次初始化 ENGINE 之前，把宿主解析的缓存目录告知引擎。
+    // Tell the engine the host-resolved cache dir before sandboxing / first ENGINE init.
+    set_compile_cache_dir(wasi_config.compile_cache_dir.clone());
     //先应用全局进程沙箱配置，不支持的配置项会打进 stderr 供审计
     apply_sandbox();
     //connect channel
     run_wasm(source, &input, &wasi_config)
 }
 
-/// 应用沙箱配置（L1，尽力而为：失败只报告不中止）并输出不支持项的警告
+/// 应用沙箱配置（L1，尽力而为：失败只报告不中止）并输出不支持/权限不足项的警告。
 fn apply_sandbox_with(cfg: &SandboxConfig) {
     for item in setup_sandbox_with(cfg) {
-        if item.status == ApplyStatus::Error {
-            eprintln!(
+        match item.status {
+            ApplyStatus::Error => eprintln!(
                 "[whitebox] sandbox capability '{}' is not supported on this platform",
                 item.capability.as_str()
-            );
+            ),
+            ApplyStatus::Denied => eprintln!(
+                "[whitebox] sandbox capability '{}' could not be applied: permission denied",
+                item.capability.as_str()
+            ),
+            _ => {}
         }
     }
 }
@@ -179,30 +277,46 @@ fn apply_sandbox() {
     apply_sandbox_with(&sandbox_config());
 }
 //阻塞运行
-fn run_wasm(source: WasmSource, _input: &Vec<u8>, cfg: &SandboxConfig) -> Result<(), WorkerError> {
-    let module = match source {
+fn run_wasm(source: WasmSource, input: &[u8], cfg: &SandboxConfig) -> Result<(), WorkerError> {
+    let component = match source {
         // 路径来源需要父进程在 spawn 前显式授权读取（默认全关闭文件系统）
         WasmSource::Path(path) => {
             load_from_wasm_file(&path).map_err(|e| WorkerError::new(WorkerExit::Load, e))?
         }
         // 字节来源不经文件系统，默认封闭文件系统下也能运行
         WasmSource::Bytes(bytes) => {
-            Module::new(&ENGINE, bytes).map_err(|e| WorkerError::new(WorkerExit::Load, e))?
+            load_wasm_bytes(bytes).map_err(|e| WorkerError::new(WorkerExit::Load, e))?
         }
     };
-    let sandbox = load_module_for_worker(module, Arc::new(AtomicBool::new(false)), cfg)
-        .map_err(|e| WorkerError::new(WorkerExit::Instantiate, e))?; //后面的flag在此处是无用的
-    SandboxHandle::run_module_for_worker(sandbox)
+    let sandbox =
+        load_component_for_worker(component, Arc::new(AtomicBool::new(false)), cfg, input)
+            .map_err(|e| WorkerError::new(WorkerExit::Instantiate, e))?; //后面的flag在此处是无用的
+    let captured = SandboxHandle::run_module_for_worker(sandbox)
         .map_err(|e| WorkerError::new(WorkerExit::Run, e))?;
+    // Capture 模式的 stdout 由这里落回 worker 的进程 stdout，父进程排空后经 wait_output 取回
+    if !captured.is_empty() {
+        use std::io::Write as _;
+        let _ = std::io::stdout().write_all(&captured);
+    }
     Ok(())
 }
 use std::io::Read;
 
+/// 单帧上限：长度前缀是 guest 不可控但协议输入端仍应设防的 u32（最高 4 GiB）。
+/// 不设上限时，构造一个超大长度即可让 worker 直接按该值分配 → OOM。
+const MAX_PROTOCOL_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 /// 从流里读一个 u32 长度前缀 + 字节数组
-fn read_bytes(r: &mut impl Read) -> Result<Vec<u8>> {
+fn read_bytes(r: &mut impl Read) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_PROTOCOL_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame length {len} exceeds limit {MAX_PROTOCOL_FRAME_BYTES}"),
+        ));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(buf)
@@ -213,133 +327,260 @@ fn write_frame(w: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()>
     w.write_all(&(bytes.len() as u32).to_le_bytes())?;
     w.write_all(bytes)
 }
-pub struct WasmSandbox<T: 'static> {
-    instance: Instance,
-    store: Store<T>,
+
+/// worker stdout 捕获上限：超出部分继续读取但丢弃。
+/// 不设上限时，恶意 guest 持续输出即可让父进程把整段输出缓进内存 → OOM。
+/// 8 MiB 足以容纳常规输出；与 `WasiStdio::Capture` 的 1 MiB 管道同为有界策略。
+const MAX_WORKER_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// 后台排空 worker stdout 并返回捕获内容：持续读取直到 EOF（避免管道写满阻塞），
+/// 但只保留前 `MAX_WORKER_STDOUT_BYTES` 字节，超限部分读取后丢弃。
+fn spawn_stdout_drain(reader: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut captured = Vec::new();
+        let mut chunk = [0u8; 8 * 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = MAX_WORKER_STDOUT_BYTES.saturating_sub(captured.len());
+                    if room > 0 {
+                        captured.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                    // 超限字节仍须继续读走：否则管道写满后 worker 会阻塞。
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        captured
+    })
 }
-// 签名/内容校验的占位结构，后续接入
-#[allow(dead_code)] // 签名/内容校验的占位结构，后续接入
-pub struct WasmMetadata {
-    pubkey: Option<Vec<u8>>,
-    signature: Option<Vec<u8>>,
-    //content_sha256:
+
+/// 端口是否落在任一授权段内（含端点）。
+fn port_in_ranges(ranges: &[PortRange], port: u16) -> bool {
+    ranges.iter().any(|(lo, hi)| port >= *lo && port <= *hi)
 }
-/// Store 的宿主状态：WASI 上下文 + 宿主自定义标记
+
+/// 端口策略（按远程端口/回环判定），与 `SocketAddrUse` 无关，亦便于单测。
+fn socket_addr_allowed(policy: &WasiSockets, addr: std::net::SocketAddr) -> bool {
+    match policy {
+        WasiSockets::None => false,
+        WasiSockets::Allow(ports) => port_in_ranges(ports, addr.port()),
+        WasiSockets::Deny(ports) => !port_in_ranges(ports, addr.port()),
+        WasiSockets::LoopbackOnly => addr.ip().is_loopback(),
+    }
+}
+
+/// 结合 `SocketAddrUse` 的完整判定（`socket_addr_check` 的宿主侧策略）：
+/// - 出站/收包（connect/send/receive）按端口/回环策略；
+/// - 绑定只放行 OS 分配临时端口的隐式绑定（connect/send 的前置步骤，地址为通配 + 端口 0），
+///   拒绝显式固定端口绑定；
+/// - 监听 / 接受入站一律拒绝：本策略只授出站，避免 guest 在宿主上开监听。
+fn socket_addr_use_allowed(
+    policy: &WasiSockets,
+    addr: std::net::SocketAddr,
+    use_: SocketAddrUse,
+) -> bool {
+    match use_ {
+        SocketAddrUse::TcpConnect | SocketAddrUse::UdpSend | SocketAddrUse::UdpReceive => {
+            socket_addr_allowed(policy, addr)
+        }
+        SocketAddrUse::TcpBind | SocketAddrUse::UdpBind => {
+            !matches!(policy, WasiSockets::None) && addr.port() == 0
+        }
+        SocketAddrUse::TcpListen | SocketAddrUse::TcpAccept => false,
+    }
+}
+
+/// 确定性墙钟：恒为 0（同 seed / 同观测，可复现）。
+struct DeterministicWallClock;
+impl wasmtime_wasi::HostWallClock for DeterministicWallClock {
+    fn resolution(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn now(&self) -> Duration {
+        Duration::ZERO
+    }
+}
+
+/// 确定性单调钟：初值取 seed 低位，每次读取前进 1ms（避免 guest 等待时间永不动而空转）。
+struct DeterministicMonotonicClock {
+    now_ns: AtomicU64,
+}
+impl DeterministicMonotonicClock {
+    fn new(seed: u128) -> Self {
+        Self {
+            now_ns: AtomicU64::new(seed as u64),
+        }
+    }
+}
+impl wasmtime_wasi::HostMonotonicClock for DeterministicMonotonicClock {
+    fn resolution(&self) -> u64 {
+        1_000_000
+    }
+    fn now(&self) -> u64 {
+        self.now_ns.fetch_add(1_000_000, Ordering::Relaxed)
+    }
+}
+// 签名/内容校验（WasmMetadata 占位）暂无消费方，已随死代码清理移除；接入签名校验时再加。
+/// Store 的宿主状态：WASI p2 上下文 + 资源表。
+/// p2 的 host 实现通过 `WasiView` 取用这里的 `WasiCtx`/`ResourceTable`。
 pub struct HostState {
-    wasi: wasmtime_wasi::p1::WasiP1Ctx,
-    marker: u32,
+    wasi: WasiCtx,
+    table: component::ResourceTable,
     shutdown_requested_only_for_threadfallback: Arc<AtomicBool>, //只对线程回落有用，不用就不管！哈！不许笑我
+    /// `WasiStdio::Capture` 时的 stdout 捕获句柄（run 后取回内容；否则 None）。
+    captured_stdout: Option<wasmtime_wasi::p2::pipe::MemoryOutputPipe>,
+    /// `WasiStdio::Capture` 时的 stderr 捕获句柄。
+    captured_stderr: Option<wasmtime_wasi::p2::pipe::MemoryOutputPipe>,
+    /// L2 资源上限（线性内存）：由 `SandboxConfig::max_memory_bytes` 派生，经 `Store::limiter` 生效。
+    limits: StoreLimits,
 }
-impl<T> WasmSandbox<T> {
-    pub fn call_func(&mut self, name: &str) -> Result<(), Error> {
-        let func = self
-            .instance
-            .get_typed_func::<(), ()>(&mut self.store, name)?;
-        func.call(&mut self.store, ())
+impl WasiView for HostState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
     }
-    pub fn new(instance: Instance, store: Store<T>) -> Self {
-        Self { instance, store }
-    }
+}
+/// worker（进程，同步）已实例化、待运行的组件沙箱。
+pub struct WorkerSandbox {
+    store: Store<HostState>,
+    command: wasmtime_wasi::p2::bindings::sync::Command,
+}
+/// thread（宿主线程回落，异步）已实例化、待运行的组件沙箱。
+pub struct ThreadSandbox {
+    store: Store<HostState>,
+    command: wasmtime_wasi::p2::bindings::Command,
 }
 //I want to write a Handle strure ,but i'am too tired ^_^.wait. .  .for me
 
-///用watch去控制thread。便于扩展
-#[derive(Clone, PartialEq, Copy)]
-pub enum ThreadCommand {
-    Shutdown,
-    Empty, //最初的填充
-           //Other(Option<Vec<v8>>) 我在想什么……
-}
 pub enum Runner {
     Thread(
         std::thread::JoinHandle<Result<()>>,
-        (watch::Sender<ThreadCommand>, Arc<AtomicBool>), /*关闭信号，本来准备写一整个数组watch但是好累，紫砂……操了还是写叭*//*草了还是需要一个关闭信号区别每个模块是否被关闭*/
+        (Arc<AtomicBool>, Arc<AtomicBool>), /* (shutdown_requested, finished)：finished 供有界等待轮询；
+                                             * 线程无法安全强杀，只能尽力打断 */
     ),
-    Process(Child),
+    /// 子进程 + stdout 排空线程 + worker stderr 日志线程。
+    /// Child + stdout drain + worker stderr log thread.
+    Process(
+        Child,
+        Option<std::thread::JoinHandle<Vec<u8>>>,
+        Option<std::thread::JoinHandle<()>>,
+    ),
 }
 /// 运行句柄：由 [`SandboxHandle::run`] / [`SandboxHandle::run_data`] 取得，
 /// 提供 `wait`（等待结果）与 `shutdown`（主动终止）两个收敛入口。
 pub struct SandboxHandle {
-    runner: Runner,
+    /// `Some` 表示尚未被 `wait*` / `shutdown` 消费；被取走后 Drop 不再做清理。
+    /// 用 Option 是因为实现 Drop 后不能再从 `self` 里按值移出字段。
+    runner: Option<Runner>,
 }
 
-pub fn load_from_wasm_file(path: &Path) -> Result<Module, wasmtime::Error> {
+impl Drop for SandboxHandle {
+    /// 句柄被丢弃却未 `wait*` / `shutdown`：尽力终止，避免 guest 脱离管控继续运行。
+    fn drop(&mut self) {
+        match self.runner.take() {
+            Some(Runner::Process(mut child, _drain, _log)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Some(Runner::Thread(_join, (shutdown_requested, _finished))) => {
+                // 只置标志 + 单次轻推 epoch：回调按 store 自己的 flag 判定，不会误杀并发运行。
+                shutdown_requested.store(true, Ordering::SeqCst);
+                ENGINE.increment_epoch();
+            }
+            None => {}
+        }
+    }
+}
+
+/// 公开入口前置检查：必须先调用 [`init`]（否则引擎/工作模式未知）。返回错误而非 panic。
+fn require_init() -> anyhow::Result<()> {
+    if IS_WORKER.get().is_none() {
+        anyhow::bail!("whitebox_core::init() 必须在任何 core 函数之前调用");
+    }
+    Ok(())
+}
+
+pub fn load_from_wasm_file(path: &Path) -> Result<component::Component, wasmtime::Error> {
+    require_init().map_err(|e| wasmtime::Error::msg(e.to_string()))?;
     // Box<dyn std::error::Error + 'static>
 
-    let module = Module::from_file(&ENGINE, path)?;
+    let component = component::Component::from_file(&ENGINE, path)?;
 
-    Ok(module)
+    Ok(component)
 }
-pub fn load_wasm_bytes(wat: Vec<u8>) -> Result<Module, wasmtime::Error> {
-    let module = Module::new(&ENGINE, wat)?;
+pub fn load_wasm_bytes(wat: Vec<u8>) -> Result<component::Component, wasmtime::Error> {
+    require_init().map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let component = component::Component::new(&ENGINE, wat)?;
 
-    Ok(module)
+    Ok(component)
 }
 //pub fn load_from_cwasm_file() {}
 
-/// 构建 Linker：注册 host_func + WASI（worker 用同步、thread 用异步）
-fn build_linker(async_wasi: bool) -> Result<Linker<HostState>, wasmtime::Error> {
-    let mut linker = Linker::new(&ENGINE);
+/// 构建 Linker：注册 WASI p2（worker 用同步、thread 用异步）。
+fn build_linker(async_wasi: bool) -> Result<component::Linker<HostState>, wasmtime::Error> {
+    let mut linker = component::Linker::new(&ENGINE);
     if async_wasi {
-        wasmtime_wasi::p1::add_to_linker_async(&mut linker, |state: &mut HostState| {
-            &mut state.wasi
-        })?;
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     } else {
-        //store.set_fuel(u64::MAX)?;考虑在开发者模式中加入可配置用以跟踪资源消耗？fuel/time
-        //不是worker模式是线程
-        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| {
-            &mut state.wasi
-        })?;
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
     }
-    linker.func_wrap(
-        "host",
-        "host_func",
-        |caller: Caller<'_, HostState>, param: i32| {
-            println!("Got {} from WebAssembly", param);
-            println!("my host state is: {}", caller.data().marker);
-        },
-    )?;
     Ok(linker)
 }
 
 /// 构建 Store（worker / thread 共用）：按调用方**显式传入**的 `SandboxConfig` WASI 段配置
 /// guest 视野（不读进程级全局，避免多实例配置互相污染）。
+/// `input` 为喂给 guest WASI stdin 的字节（空则按模式：Inherit 继承宿主 / Capture 空 / Null）。
 /// WASI 是 L2：**配置失败必须报错终止**（如 preopen 目录打不开），由调用方冒泡成错误。
 fn build_store(
     shutdown_flag: Arc<AtomicBool>,
     cfg: &SandboxConfig,
+    input: &[u8],
 ) -> Result<Store<HostState>, wasmtime::Error> {
     let mut builder = wasmtime_wasi::WasiCtxBuilder::new();
 
     use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
     match cfg.wasi_stdin {
-        WasiStdio::Inherit => {
+        // 有显式输入时优先喂给 guest（不论 Inherit/Capture）
+        WasiStdio::Inherit if input.is_empty() => {
             builder.inherit_stdin();
         }
-        WasiStdio::Capture => {
-            builder.stdin(MemoryInputPipe::new(Vec::<u8>::new()));
+        WasiStdio::Inherit | WasiStdio::Capture => {
+            builder.stdin(MemoryInputPipe::new(input.to_vec()));
         }
         WasiStdio::Null => {
             builder.stdin(std::io::empty());
         }
     }
+    let mut captured_stdout = None;
     match cfg.wasi_stdout {
         WasiStdio::Inherit => {
             builder.inherit_stdout();
         }
         WasiStdio::Capture => {
-            builder.stdout(MemoryOutputPipe::new(1 << 20));
+            // 保留 pipe 句柄，run 之后可取回内容（否则随 ctx 丢弃、行为≈Null）
+            let pipe = MemoryOutputPipe::new(1 << 20);
+            builder.stdout(pipe.clone());
+            captured_stdout = Some(pipe);
         }
         WasiStdio::Null => {
             builder.stdout(std::io::empty());
         }
     }
+    let mut captured_stderr = None;
     match cfg.wasi_stderr {
         WasiStdio::Inherit => {
             builder.inherit_stderr();
         }
         WasiStdio::Capture => {
-            builder.stderr(MemoryOutputPipe::new(1 << 20));
+            let pipe = MemoryOutputPipe::new(1 << 20);
+            builder.stderr(pipe.clone());
+            captured_stderr = Some(pipe);
         }
         WasiStdio::Null => {
             builder.stderr(std::io::empty());
@@ -370,94 +611,291 @@ fn build_store(
             })?;
     }
 
-    let wasi_ctx = builder.build_p1();
-    Ok(Store::new(
+    // WASI sockets（L2）：默认 None 完全禁用；其余策略统一经 socket_addr_allowed 过滤远程地址
+    match &cfg.wasi_sockets {
+        WasiSockets::None => {
+            builder
+                .allow_tcp(false)
+                .allow_udp(false)
+                .allow_ip_name_lookup(false);
+        }
+        _ => {
+            builder
+                .allow_tcp(true)
+                .allow_udp(true)
+                .allow_ip_name_lookup(cfg.wasi_ip_name_lookup);
+            let policy = cfg.wasi_sockets.clone();
+            builder.socket_addr_check(move |addr, use_| {
+                let ok = socket_addr_use_allowed(&policy, addr, use_);
+                Box::pin(async move { ok })
+            });
+        }
+    }
+
+    // 其余可配置的 WASI 限制面
+    if let Some(cwd) = &cfg.wasi_initial_cwd {
+        builder.initial_cwd(cwd);
+    }
+    if let Some(max) = cfg.wasi_max_random_size {
+        builder.max_random_size(max);
+    }
+    builder.allow_blocking_current_thread(cfg.wasi_allow_blocking_current_thread);
+
+    // WASI clocks（L2）：Deterministic 用固定时钟，便于可复现运行
+    match cfg.wasi_clocks {
+        WasiClocks::Host => {}
+        WasiClocks::Deterministic(seed) => {
+            builder.wall_clock(DeterministicWallClock);
+            builder.monotonic_clock(DeterministicMonotonicClock::new(seed));
+        }
+    }
+
+    // WASI random（L2）：Seeded 只播种**非安全流**（wasi:random/insecure + insecure-seed），
+    // 安全流 wasi:random/random 保持 wasmtime 默认的 OS 真随机（thread_rng），不被种子降级为可预测。
+    match cfg.wasi_random {
+        WasiRandom::Os => {}
+        WasiRandom::Seeded(seed) => {
+            builder.insecure_random_seed(seed);
+            builder.insecure_random(wasmtime_wasi::Deterministic::new(seed.to_le_bytes().to_vec()));
+        }
+    }
+
+    // L2 内存上限：把 max_memory_bytes 接到 StoreLimits（每块线性内存可增长到的字节上限）。
+    // 比 OS 的 RLIMIT_AS 可靠——wasmtime 的大块虚拟地址预留不会被误杀。
+    let limits = match cfg.max_memory_bytes {
+        Some(bytes) => wasmtime::StoreLimitsBuilder::new()
+            .memory_size(usize::try_from(bytes).unwrap_or(usize::MAX))
+            .build(),
+        None => StoreLimits::default(),
+    };
+
+    let wasi_ctx = builder.build();
+    let mut store = Store::new(
         &ENGINE,
         HostState {
             wasi: wasi_ctx,
-            marker: 4,
+            table: component::ResourceTable::new(),
             shutdown_requested_only_for_threadfallback: shutdown_flag,
+            captured_stdout,
+            captured_stderr,
+            limits,
         },
-    ))
+    );
+    // 挂上 ResourceLimiter：guest 线性内存增长超限时 memory.grow 返回 -1
+    store.limiter(|state| &mut state.limits);
+    Ok(store)
 }
 
-/// worker（进程）用加载：同步 linker + 同步 instantiate。
+/// worker（进程）用加载：同步 linker + `sync::Command` 实例化。
 /// worker 引擎是纯同步配置，无需 tokio，也不会踩 epoch 问题。
-pub fn load_module_for_worker(
-    module: Module,
+pub fn load_component_for_worker(
+    component: component::Component,
     shutdown_flag: Arc<AtomicBool>,
     cfg: &SandboxConfig,
-) -> Result<WasmSandbox<HostState>, wasmtime::Error> {
+    input: &[u8],
+) -> Result<WorkerSandbox, wasmtime::Error> {
     let linker = build_linker(false)?;
-    let mut store = build_store(shutdown_flag, cfg)?;
-    let instance = linker.instantiate(&mut store, &module)?;
-    Ok(WasmSandbox::new(instance, store))
+    let mut store = build_store(shutdown_flag, cfg, input)?;
+    let command =
+        wasmtime_wasi::p2::bindings::sync::Command::instantiate(&mut store, &component, &linker)?;
+    Ok(WorkerSandbox { store, command })
 }
 
-/// thread（宿主/线程回落）用加载：异步 linker + instantiate_async。
+/// thread（宿主/线程回落）用加载：异步 linker + `Command::instantiate_async`。
 /// 必须在调用方自己的 tokio runtime 内 await（禁止再起嵌套 runtime）。
-pub async fn load_module_for_thread(
-    module: Module,
+pub async fn load_component_for_thread(
+    component: component::Component,
     shutdown_flag: Arc<AtomicBool>,
     cfg: &SandboxConfig,
-) -> Result<WasmSandbox<HostState>, wasmtime::Error> {
+    input: &[u8],
+) -> Result<ThreadSandbox, wasmtime::Error> {
     let linker = build_linker(true)?;
-    let mut store = build_store(shutdown_flag, cfg)?;
-    // epoch 打断：必须在 instantiate_async 之前设置，否则默认 deadline=0（恒已过期）会 Trap::Interrupt
+    let mut store = build_store(shutdown_flag, cfg, input)?;
+    // epoch 打断：必须在实例化之前设置，否则默认 deadline=0（恒已过期）会 Trap::Interrupt
     store.set_epoch_deadline(1);
     store.epoch_deadline_callback(SandboxHandle::epoch_callback);
     // add_to_linker_async 注册的导入会把 store 标记为 async-required，只能走 instantiate_async
-    let instance = linker.instantiate_async(&mut store, &module).await?;
-    Ok(WasmSandbox::new(instance, store))
+    let command =
+        wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut store, &component, &linker)
+            .await?;
+    Ok(ThreadSandbox { store, command })
 }
 use std::process::{Child, Command, Stdio};
 
 use crate::Runner::{Process, Thread};
 use wasmtime::{StoreContextMut, UpdateDeadline};
 
+/// 有界等待/关闭时的轮询间隔、超时后轻推 epoch 的宽限：由用户配置 `run.json` 提供。
+/// Poll interval & shutdown grace for bounded waits: from user config `run.json`.
+fn poll_interval() -> Duration {
+    Duration::from_millis(crate::config::run().poll_ms)
+}
+fn shutdown_grace() -> Duration {
+    Duration::from_millis(crate::config::run().shutdown_grace_ms)
+}
+
 impl SandboxHandle {
-    /// 等待运行结束并返回结果。
-    /// - `Thread`：join 线程，合并内部错误；
-    /// - `Process`：`wait` 子进程，按 [`WorkerExit`] 解码退出码（非 0 视为失败）。
+    /// 等待运行结束并返回结果（**无界**，可能永久阻塞）。
+    /// 需要上界请用 [`SandboxHandle::wait_timeout`]；需要 stdout 请用 [`SandboxHandle::wait_output`]。
     pub fn wait(self) -> anyhow::Result<()> {
-        match self.runner {
-            Runner::Thread(joinhandle, _) => joinhandle
-                .join()
-                .map_err(|_| anyhow::anyhow!("worker thread panicked"))?
-                .map_err(|e| anyhow::anyhow!("{e}")),
-            Runner::Process(mut child) => {
-                let status = child.wait()?;
-                if status.success() {
-                    return Ok(());
-                }
-                match status.code() {
-                    Some(code) => match WorkerExit::decode(code) {
-                        Ok(worker_exit) => {
-                            anyhow::bail!("worker failed (exit {code}: {:?})", worker_exit)
+        self.wait_inner(None).map(|_| ())
+    }
+
+    /// 等待运行结束并返回捕获的 worker stdout（无界）。
+    /// `Thread` 路径恒为空（线程内 guest 直接写宿主 stdout，无独立管道）。
+    pub fn wait_output(self) -> anyhow::Result<Vec<u8>> {
+        self.wait_inner(None)
+    }
+
+    /// 有界等待：最多等 `timeout`，超时则请求关闭并尽力打断后放弃。
+    ///
+    /// - `Process`：超时即 `kill()` 并回收，是真正的强杀。
+    /// - `Thread`：超时后置关闭标志并**循环轻推 epoch**（不依赖单次 epoch 命中），
+    ///   若因此结束则返回真实结果；若仍卡在不可打断的宿主调用，则放弃该线程
+    ///   （Rust 线程无法安全强杀，会造成有界泄漏），返回超时错误。
+    pub fn wait_timeout(self, timeout: Duration) -> anyhow::Result<()> {
+        self.wait_inner(Some(timeout)).map(|_| ())
+    }
+
+    /// 同 [`SandboxHandle::wait_timeout`]，但返回捕获的 worker stdout。
+    pub fn wait_output_timeout(self, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+        self.wait_inner(Some(timeout))
+    }
+
+    /// 等待实现（`timeout = None` 无界）。返回捕获的 worker stdout（线程路径为空）。
+    fn wait_inner(mut self, timeout: Option<Duration>) -> anyhow::Result<Vec<u8>> {
+        let start = Instant::now();
+        let runner = self
+            .runner
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("SandboxHandle 已被消费"))?;
+        match runner {
+            Runner::Thread(joinhandle, (shutdown_requested, finished)) => {
+                if let Some(timeout) = timeout {
+                    while !finished.load(Ordering::SeqCst) && start.elapsed() < timeout {
+                        std::thread::sleep(poll_interval());
+                    }
+                    if !finished.load(Ordering::SeqCst) {
+                        shutdown_requested.store(true, Ordering::SeqCst);
+                        Self::nudge_until_finished(&finished, shutdown_grace());
+                        if !finished.load(Ordering::SeqCst) {
+                            return Err(anyhow::anyhow!(
+                                "thread run exceeded {timeout:?}; abandoned (not force-killable)"
+                            ));
                         }
-                        Err(unknown) => {
-                            anyhow::bail!("worker failed with unknown exit code {unknown}")
-                        }
-                    },
-                    None => anyhow::bail!("worker terminated by signal"),
+                    }
                 }
+                Self::join_thread(joinhandle)?;
+                Ok(Vec::new())
+            }
+            Runner::Process(mut child, drain, log) => {
+                if let Some(timeout) = timeout {
+                    while child.try_wait()?.is_none() && start.elapsed() < timeout {
+                        std::thread::sleep(poll_interval());
+                    }
+                    if child.try_wait()?.is_none() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = drain.and_then(|h| h.join().ok());
+                        // 与 shutdown()/finish_process 一致：日志线程也回收（EOF 后应已结束）。
+                        if let Some(log) = log {
+                            let _ = log.join();
+                        }
+                        return Err(anyhow::anyhow!("worker process exceeded {timeout:?}; killed"));
+                    }
+                }
+                Self::finish_process(child, drain, log)
             }
         }
     }
 
-    pub fn shutdown(self) -> anyhow::Result<()> {
-        match self.runner {
-            Thread(joinhandle, (_tx, shutdown_requested)) => {
-                shutdown_requested.store(true, Ordering::Relaxed); //写入关闭标记
-                ENGINE.to_owned().increment_epoch(); //直接调用计数，但不保证一定能立刻杀掉。直接搞会导致全误杀，我添加一个回调atomicbool检查来处理误杀。
-                let _ = joinhandle.join(); //这个错误需要传播吗？我先想想，之后再说。喵喵喵喵喵喵喵喵喵！
+    /// 请求关闭并等待结束（有界）。
+    ///
+    /// - `Process`：`kill()` + `wait()` 强杀，并回收 stdout 排空线程。
+    /// - `Thread`：置关闭标志后**循环轻推 epoch** 直到线程结束或超过宽限期；
+    ///   仍不结束则返回错误（线程已放弃，无法安全强杀）。
+    pub fn shutdown(mut self) -> anyhow::Result<()> {
+        let runner = self
+            .runner
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("SandboxHandle 已被消费"))?;
+        match runner {
+            Thread(joinhandle, (shutdown_requested, finished)) => {
+                shutdown_requested.store(true, Ordering::SeqCst); //写入关闭标记
+                // 循环轻推：单次 increment_epoch 不保证命中，循环检查 finished 直到结束或宽限期
+                Self::nudge_until_finished(&finished, shutdown_grace());
+                if finished.load(Ordering::SeqCst) {
+                    // 关闭成功；线程内 guest 因关闭而返回的错误属预期，只上报 panic
+                    let _ = joinhandle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("worker thread panicked"))?;
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "shutdown grace period elapsed; thread abandoned (not force-killable)"
+                    ))
+                }
             }
-            Process(mut child) => {
-                let _ = child.kill();
-                let _ = child.wait();
+            Process(mut child, drain, log) => {
+                let _ = child.kill(); // 进程可能已退出，kill 报错可忽略
+                let wait = child.wait(); // 回收（拒绝僵尸）
+                let _ = drain.and_then(|h| h.join().ok());
+                if let Some(log) = log {
+                    let _ = log.join(); // stderr 已 EOF，日志线程应已结束
+                }
+                wait?;
+                Ok(())
             }
         }
-        Ok(())
+    }
+
+    /// 回收子进程：等待退出 → join stdout 排空线程取回捕获 → 按退出码解码。返回捕获的 stdout。
+    fn finish_process(
+        mut child: Child,
+        drain: Option<std::thread::JoinHandle<Vec<u8>>>,
+        log: Option<std::thread::JoinHandle<()>>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let status = child.wait()?;
+        let output = drain.and_then(|h| h.join().ok()).unwrap_or_default();
+        if let Some(log) = log {
+            let _ = log.join(); // stderr 已 EOF，日志线程应已结束
+        }
+        Self::decode_process_status(status)?;
+        Ok(output)
+    }
+
+    /// join 线程并把 panic / 内部错误转成 `anyhow`。
+    fn join_thread(joinhandle: std::thread::JoinHandle<Result<()>>) -> anyhow::Result<()> {
+        joinhandle
+            .join()
+            .map_err(|_| anyhow::anyhow!("worker thread panicked"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// 循环轻推 epoch，直到 `finished` 置位或超过 `grace`。多次轻推避免单次 epoch 的时序问题。
+    fn nudge_until_finished(finished: &AtomicBool, grace: Duration) {
+        let start = Instant::now();
+        while !finished.load(Ordering::SeqCst) {
+            ENGINE.increment_epoch();
+            if start.elapsed() >= grace {
+                break;
+            }
+            std::thread::sleep(poll_interval());
+        }
+    }
+
+    /// 按 [`WorkerExit`] 解码子进程退出状态（非 0 视为失败）。
+    fn decode_process_status(status: std::process::ExitStatus) -> anyhow::Result<()> {
+        if status.success() {
+            return Ok(());
+        }
+        match status.code() {
+            Some(code) => match WorkerExit::decode(code) {
+                Ok(worker_exit) => anyhow::bail!("worker failed (exit {code}: {:?})", worker_exit),
+                Err(unknown) => anyhow::bail!("worker failed with unknown exit code {unknown}"),
+            },
+            None => anyhow::bail!("worker terminated by signal"),
+        }
     }
     /// 以独立 worker 进程运行指定 wasm **文件**，并把沙箱参数作为第三帧传给 worker。
     /// 进程创建失败时回落到线程模式（相机应对）。
@@ -472,16 +910,48 @@ impl SandboxHandle {
     ///
     /// 若不想授文件路径权限，请改用 [`SandboxHandle::run_data`]（字节直传，不落盘）。
     pub fn run(path: PathBuf, config: &SandboxConfig) -> anyhow::Result<SandboxHandle> {
-        Self::run_source(&WasmSource::Path(path), config)
+        Self::run_with_input(path, Vec::new(), config)
+    }
+
+    /// 同 [`SandboxHandle::run`]，并额外把 `input` 作为 guest WASI stdin 输入喂入。
+    pub fn run_with_input(
+        path: PathBuf,
+        input: Vec<u8>,
+        config: &SandboxConfig,
+    ) -> anyhow::Result<SandboxHandle> {
+        Self::run_source(&WasmSource::Path(path), &input, config)
     }
 
     /// 以独立 worker 进程运行内存中的 wasm 字节（不落盘、走字节帧传输，
     /// 默认封闭文件系统下也无需授权路径）。其余行为与 [`SandboxHandle::run`] 一致。
     pub fn run_data(data: Vec<u8>, config: &SandboxConfig) -> anyhow::Result<SandboxHandle> {
-        Self::run_source(&WasmSource::Bytes(data), config)
+        Self::run_data_with_input(data, Vec::new(), config)
     }
 
-    fn run_source(source: &WasmSource, config: &SandboxConfig) -> anyhow::Result<SandboxHandle> {
+    /// 同 [`SandboxHandle::run_data`]，并额外把 `input` 作为 guest WASI stdin 输入喂入。
+    pub fn run_data_with_input(
+        data: Vec<u8>,
+        input: Vec<u8>,
+        config: &SandboxConfig,
+    ) -> anyhow::Result<SandboxHandle> {
+        Self::run_source(&WasmSource::Bytes(data), &input, config)
+    }
+
+    fn run_source(
+        source: &WasmSource,
+        input: &[u8],
+        config: &SandboxConfig,
+    ) -> anyhow::Result<SandboxHandle> {
+        require_init()?;
+        // 配置冲突提前拒绝：worker 侧 setup_sandbox_with 用 assert! 表达开发者不变量，
+        // 直接把冲突配置送进去会变成 panic / 未知退出码，应在入口返回可诊断错误。
+        let violations = config.validate();
+        if !violations.is_empty() {
+            anyhow::bail!("沙箱配置冲突：{}", violations.join("；"));
+        }
+        // 在 spawn/线程回退与首次 ENGINE 初始化之前设置宿主解析的缓存目录。
+        // Set the host-resolved cache dir before spawning/thread fallback and ENGINE init.
+        set_compile_cache_dir(config.compile_cache_dir.clone());
         // set self exe path
         #[cfg(target_os = "linux")]
         let exe = std::path::PathBuf::from("/proc/self/exe"); //更安全
@@ -489,11 +959,46 @@ impl SandboxHandle {
         #[cfg(not(target_os = "linux"))]
         let exe = std::env::current_exe()?;
 
+        // 调试/集成测试钩子：`test_hooks::worker_exe(..)` 覆盖 worker 可执行文件（默认自身）。
+        // 仅 debug 构建生效（release 编译掉，生产始终用自身）。集成测试进程并非 worker 入口，
+        // 借此指向真正的 worker 二进制来端到端验证进程链路。
+        #[cfg(debug_assertions)]
+        let exe = test_hooks::worker_exe_override().unwrap_or(exe);
+
         let mut command = Command::new(exe);
+        // worker stderr 继承宿主，作为 worker 进程日志；guest stderr 已由配置隔离
+        // （CLI 为 Null），因此该日志只含宿主/引擎诊断。
+        // The worker's stderr is inherited as the worker log; guest stderr is isolated by
+        // config (Null in the CLI), so this log only carries host/engine diagnostics.
         //必须先清环境再设置标志：env_clear() 会抹掉其后设置的全部变量，反之则保留
         command
             .env_clear() // 清掉其他所有 env
             .env("__WASM_WORKER", "1");
+        // 保留父进程的临时目录：worker 的 env_clear 会让 std::env::temp_dir() 回退到
+        // 共享 /tmp（Unix）或 C:\Windows（Windows），使 temp_allow_write 指向错误位置。
+        // Preserve the host temp dir: after env_clear, temp_dir() would fall back to shared
+        // /tmp (Unix) or C:\Windows (Windows), mis-targeting temp_allow_write.
+        // 优先应用自己的 temp（Linux 每用户 runtime / portable <exe_dir>/tmp）；仅在
+        // temp_allow_write 请求时创建它（避免无谓副作用），否则要求已存在；最后回退 OS temp。
+        // 这样 temp_allow_write 的 L1 规则不会因目录不存在或落在共享 /tmp 而失效。
+        // Prefer the app temp; create it only when temp_allow_write is requested; otherwise
+        // require it to exist; finally fall back to the OS temp. This keeps the L1 rule from
+        // failing on a missing dir or silently targeting shared /tmp.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let host_temp = match crate::dir::tmp_dir() {
+            Ok(p) if p.is_dir() => p,
+            Ok(p) if config.temp_allow_write && crate::dir::ensure_dir(&p).is_ok() => p,
+            _ => std::env::temp_dir(),
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let host_temp = std::env::temp_dir();
+        #[cfg(unix)]
+        command.env("TMPDIR", host_temp.as_os_str());
+        #[cfg(windows)]
+        {
+            command.env("TEMP", host_temp.as_os_str());
+            command.env("TMP", host_temp.as_os_str());
+        }
         //.env("PATH", "/usr/bin:/bin") // 补回最小 PATH
         // Windows 上 DLL 搜索依赖 SystemRoot：清空后至少恢复最小 PATH，否则 worker 可能起不来
         #[cfg(target_os = "windows")]
@@ -501,24 +1006,23 @@ impl SandboxHandle {
             let sys = system_root.to_string_lossy();
             command.env("PATH", format!("{sys}\\System32;{sys}"));
         }
-        // 调试/集成测试钩子：WHITEBOX_FORCE_THREAD_FALLBACK=1 强制走线程回退。
-        // 仅 debug 构建生效（release 编译掉，避免生产被会话级 env 静默降级）。如果有需求再开
-        // 该变量只被父进程读取；worker 经 env_clear() 启动，不会继承，也不读它。
+        // 调试/集成测试钩子：`test_hooks::force_thread_fallback(true)` 强制走线程回退。
+        // 仅 debug 构建生效（release 编译掉，避免生产被静默降级）。
         let spawn_command_result = {
             #[cfg(debug_assertions)]
             {
-                if std::env::var_os("WHITEBOX_FORCE_THREAD_FALLBACK").is_some() {
+                if test_hooks::thread_fallback_forced() {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        "WHITEBOX_FORCE_THREAD_FALLBACK set",
+                        "test hook: force_thread_fallback(true)",
                     ))
                 } else {
-                    command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
+                    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
                 }
             }
             #[cfg(not(debug_assertions))]
             {
-                command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
+                command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
             }
         };
         //匿名通道相对安全，如果这个都保证不了安全的情况我觉得好像也没什么其它办法可以保护了（）
@@ -534,8 +1038,8 @@ impl SandboxHandle {
                     };
                     let source_bytes = postcard::to_stdvec(source)?;
                     write_frame(&mut stdin, &source_bytes)?;
-                    let input: Vec<u8> = Vec::new();
-                    let input_bytes = postcard::to_stdvec(&input)?;
+                    // 帧 2 = guest WASI stdin 输入（空则按模式）
+                    let input_bytes = postcard::to_stdvec(input)?;
                     write_frame(&mut stdin, &input_bytes)?;
                     let config_bytes = postcard::to_stdvec(config)?;
                     write_frame(&mut stdin, &config_bytes)?;
@@ -546,40 +1050,79 @@ impl SandboxHandle {
                     let _ = child.kill();
                     return Err(e);
                 }
+                // 结果通道：排空 worker stdout，避免 guest 大量写满管道阻塞；捕获供 wait_output 取回。
+                let drain = child.stdout.take().map(spawn_stdout_drain);
+                // worker stderr：异步转义并写入日志文件（有上限），不直接接到宿主 stderr。
+                let log = child.stderr.take().map(worker_log::spawn_worker_log_drain);
                 anyhow::Ok(SandboxHandle {
-                    runner: Runner::Process(child),
+                    runner: Some(Runner::Process(child, drain, log)),
                 })
             }
             Err(_) => {
                 //创建进程失败，回落到创建线程
+                eprintln!(
+                    "[whitebox] 警告：进程创建失败，回退到线程模式——无进程隔离；\
+                     为避免把不可逆的 L1 限制（chroot/landlock/rlimit/Job）施加到宿主进程，\
+                     线程回退不应用 L1，仅保留 L2（WASI）限制"
+                );
 
-                let config = config.clone();
+                let mut config = config.clone();
+                // 线程回退没有进程隔离：不把 guest 输出直接接到宿主 stdio。
+                // - stdout: Inherit → Capture（有界，仍由上层输出）
+                // - stderr: 一律 Null（防止污染宿主日志/终端）
+                // Thread fallback has no process isolation: never wire guest output directly
+                // to host stdio. stdout Inherit→Capture (bounded); stderr always Null.
+                if config.wasi_stdout == WasiStdio::Inherit {
+                    config.wasi_stdout = WasiStdio::Capture;
+                }
+                config.wasi_stderr = WasiStdio::Null;
                 let source = source.clone();
+                let input = input.to_vec();
                 let shutdown_flag_for_thread = Arc::new(AtomicBool::new(false));
                 let shutdown_flag_clone = shutdown_flag_for_thread.clone();
-                let (tx, rx) = watch::channel(ThreadCommand::Empty); //信号
+                let finished = Arc::new(AtomicBool::new(false));
+                let finished_for_thread = finished.clone();
                 let thread = std::thread::spawn(move || -> Result<()> {
-                    //线程模式没有任何进程隔离，仅尽力应用沙箱限制（显式传本次配置，不写全局）
-                    apply_sandbox_with(&config);
+                    // 无论成功/失败/panic 都标记完成，供有界等待（wait_timeout/shutdown）解除阻塞。
+                    // 用 Drop guard 而非末尾 store：闭包内部 panic 时也能置位。
+                    // Mark finished on every exit path (success/err/panic): use a Drop guard,
+                    // not a trailing store, so an inner panic still unblocks bounded waits.
+                    struct MarkDone(Arc<AtomicBool>);
+                    impl Drop for MarkDone {
+                        fn drop(&mut self) {
+                            self.0.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    let _mark = MarkDone(finished_for_thread.clone());
+                    // 线程回退不应用 L1：chroot/landlock/rlimit/Job 等是进程级且不可逆，
+                    // 施加到宿主会封死/误杀宿主；L1 只在有进程隔离的 worker 内生效。
                     // 加载与运行在同一个 current-thread runtime 内闭环，避免嵌套 runtime panic
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
-                    let result = rt.block_on(async move {
-                        let module = match source {
+                    let result: Result<()> = rt.block_on(async move {
+                        let component = match source {
                             WasmSource::Path(path) => load_from_wasm_file(&path)?,
-                            WasmSource::Bytes(bytes) => Module::new(&ENGINE, bytes)?,
+                            WasmSource::Bytes(bytes) => load_wasm_bytes(bytes)?,
                         };
-                        let sandbox =
-                            load_module_for_thread(module, shutdown_flag_clone, &config).await?;
-                        Self::run_module_for_thread(sandbox, rx).await
+                        let sandbox = load_component_for_thread(
+                            component,
+                            shutdown_flag_clone,
+                            &config,
+                            &input,
+                        )
+                        .await?;
+                        let _out = Self::run_module_for_thread(sandbox).await?;
+                        // 线程路径不输出 guest stdout（策略待定，避免终端注入）。
+                        // Do not emit guest stdout from the thread path (policy TBD;
+                        // avoid terminal injection).
+                        Ok(())
                     });
                     result?; //传播错误
-
                     Ok(())
                 });
                 anyhow::Ok(SandboxHandle {
-                    runner: Runner::Thread(thread, (tx, shutdown_flag_for_thread)),
+                    runner: Some(Runner::Thread(thread, (shutdown_flag_for_thread, finished))),
                 })
             }
         }
@@ -590,7 +1133,7 @@ impl SandboxHandle {
         let data = ctx.data(); //拿到储存到hoststate的数据
         if data
             .shutdown_requested_only_for_threadfallback
-            .load(Ordering::Relaxed)
+            .load(Ordering::SeqCst)
         //
         {
             Err(wasmtime::Error::msg("Shutdown requested"))
@@ -598,64 +1141,47 @@ impl SandboxHandle {
             Ok(UpdateDeadline::Continue(1))
         }
     }
-    pub fn run_module_for_worker(
-        mut sandbox: WasmSandbox<HostState>,
-    ) -> Result<(), wasmtime::error::Error> {
-        let start = sandbox
-            .instance
-            .get_typed_func::<(), ()>(&mut sandbox.store, "_start")?;
-        start.call(&mut sandbox.store, ())?;
-        Ok(())
-    }
-    // watch 取消线路暂时整体注释：关闭统一走 shutdown() 的 epoch/increment + HostState flag
-    pub async fn run_module_for_thread(
-        mut sandbox: WasmSandbox<HostState>,
-        _rx: watch::Receiver<ThreadCommand>,
-    ) -> Result<(), wasmtime::error::Error> {
-        let start = sandbox
-            .instance
-            .get_typed_func::<(), ()>(&mut sandbox.store, "_start")?;
-
-        // deadline+callback 幂等刷新（load_module 已在实例化前置好；shutdown 依赖 epoch）
-        sandbox.store.set_epoch_deadline(1);
-        sandbox.store.epoch_deadline_callback(Self::epoch_callback);
-        /*
-        let watch_task = tokio::spawn(async move {
-            loop {
-                if let Err(e) = rx.changed().await {
-                    //通道关闭了
-                    break;
-                };
-
-                match *rx.borrow_and_update() {
-                    ThreadCommand::Shutdown => {
-                        //经过分析认为此处不可靠直接移到shutdown函数去
-                        //ENGINE.to_owned().increment_epoch();
-                    }
-                    ThreadCommand::Empty => {}
-                }
-            }
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        });
-        tokio::select! {
-            result = start.call_async(&mut sandbox.store, ()) => {
-                result?;
-            }
-            _ = watch_task => {
-                // sender 关闭了，但通常不会走到这里
+    /// 取回 `WasiStdio::Capture` 捕获的 stderr（转发到宿主 stderr）与 stdout（返回，供上层输出/结果通道）。
+    fn drain_captured(store: &Store<HostState>) -> Vec<u8> {
+        let data = store.data();
+        if let Some(pipe) = data.captured_stderr.as_ref() {
+            let bytes = pipe.contents();
+            if !bytes.is_empty() {
+                use std::io::Write as _;
+                let _ = std::io::stderr().write_all(&bytes);
             }
         }
-        */
-        start.call_async(&mut sandbox.store, ()).await?;
+        data.captured_stdout
+            .as_ref()
+            .map(|pipe| pipe.contents().to_vec())
+            .unwrap_or_default()
+    }
 
-        /*无参数启动 */
-        Ok(())
+    /// 运行 worker 组件，返回 `WasiStdio::Capture` 捕获的 stdout（其余情况为空）。
+    pub fn run_module_for_worker(mut sandbox: WorkerSandbox) -> Result<Vec<u8>, wasmtime::error::Error> {
+        let run_result = sandbox.command.wasi_cli_run().call_run(&mut sandbox.store);
+        let captured = Self::drain_captured(&sandbox.store);
+        run_result?.map_err(|()| wasmtime::Error::msg("guest wasi:cli/run returned an error"))?;
+        Ok(captured)
+    }
+    /// 运行 thread（回退）组件，返回 `WasiStdio::Capture` 捕获的 stdout。
+    pub async fn run_module_for_thread(
+        mut sandbox: ThreadSandbox,
+    ) -> Result<Vec<u8>, wasmtime::error::Error> {
+        let run_result = sandbox
+            .command
+            .wasi_cli_run()
+            .call_run(&mut sandbox.store)
+            .await;
+        let captured = Self::drain_captured(&sandbox.store);
+        run_result?.map_err(|()| wasmtime::Error::msg("guest wasi:cli/run returned an error"))?;
+        Ok(captured)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::WorkerExit;
+    use super::{WasiSockets, WorkerExit};
 
     #[test]
     fn worker_exit_code_roundtrip() {
@@ -673,5 +1199,97 @@ mod tests {
             assert_eq!(got, want);
         }
         assert_eq!(WorkerExit::decode(99), Err(99));
+    }
+
+    #[test]
+    fn stdout_drain_captures_all_bytes() {
+        // 守护结果通道：排空线程必须完整读取直到 EOF（大 payload 也不能截断）
+        let payload = vec![0xA5u8; 200_000];
+        let handle = super::spawn_stdout_drain(std::io::Cursor::new(payload.clone()));
+        assert_eq!(handle.join().expect("drain thread must not panic"), payload);
+    }
+
+    #[test]
+    fn socket_policy_allow_deny_loopback_none() {
+        // sockets 端口策略判定（socket_addr_check 的宿主侧逻辑）
+        let allow = WasiSockets::Allow(vec![(8000, 9000)]);
+        assert!(super::socket_addr_allowed(
+            &allow,
+            "1.2.3.4:8500".parse().unwrap()
+        ));
+        assert!(!super::socket_addr_allowed(
+            &allow,
+            "1.2.3.4:80".parse().unwrap()
+        ));
+
+        let deny = WasiSockets::Deny(vec![(25, 25)]);
+        assert!(!super::socket_addr_allowed(
+            &deny,
+            "1.2.3.4:25".parse().unwrap()
+        ));
+        assert!(super::socket_addr_allowed(
+            &deny,
+            "1.2.3.4:443".parse().unwrap()
+        ));
+
+        assert!(super::socket_addr_allowed(
+            &WasiSockets::LoopbackOnly,
+            "127.0.0.1:9".parse().unwrap()
+        ));
+        assert!(!super::socket_addr_allowed(
+            &WasiSockets::LoopbackOnly,
+            "8.8.8.8:9".parse().unwrap()
+        ));
+
+        assert!(!super::socket_addr_allowed(
+            &WasiSockets::None,
+            "127.0.0.1:9".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn stdout_drain_truncates_at_cap() {
+        // 守护捕获上限：超限仍要排空到 EOF，但只保留前 MAX_WORKER_STDOUT_BYTES 字节
+        let payload = vec![7u8; super::MAX_WORKER_STDOUT_BYTES + 1024];
+        let handle = super::spawn_stdout_drain(std::io::Cursor::new(payload));
+        let out = handle.join().expect("drain thread must not panic");
+        assert_eq!(out.len(), super::MAX_WORKER_STDOUT_BYTES);
+        assert!(out.iter().all(|b| *b == 7));
+    }
+
+    #[test]
+    fn socket_use_policy_only_allows_outbound() {
+        use wasmtime_wasi::sockets::SocketAddrUse;
+
+        let allow = WasiSockets::Allow(vec![(443, 443)]);
+        let remote: std::net::SocketAddr = "1.2.3.4:443".parse().unwrap();
+        // 出站允许
+        assert!(super::socket_addr_use_allowed(
+            &allow,
+            remote,
+            SocketAddrUse::TcpConnect
+        ));
+        // 显式固定端口绑定被拒，隐式临时绑定（端口 0）放行
+        assert!(!super::socket_addr_use_allowed(
+            &allow,
+            remote,
+            SocketAddrUse::TcpBind
+        ));
+        assert!(super::socket_addr_use_allowed(
+            &allow,
+            "0.0.0.0:0".parse().unwrap(),
+            SocketAddrUse::TcpBind
+        ));
+        // 监听 / 接受入站一律拒绝
+        assert!(!super::socket_addr_use_allowed(
+            &allow,
+            remote,
+            SocketAddrUse::TcpListen
+        ));
+        assert!(!super::socket_addr_use_allowed(
+            &allow,
+            remote,
+            SocketAddrUse::TcpAccept
+        ));
     }
 }

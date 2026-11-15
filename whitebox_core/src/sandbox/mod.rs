@@ -36,7 +36,7 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -157,12 +157,15 @@ impl SandboxCapability {
 /// - `Applied`：请求了，并且已成功应用。
 /// - `Skipped`：配置中没有请求该项。
 /// - `Error`：请求了，但当前平台 / 内核 / 权限不支持，无法应用（即“不支持 → error”）。
+/// - `Denied`：请求了，平台本身支持，但当前权限不足（如 Windows 管理员进程无法施加
+///   `JOB_OBJECT_SECURITY_NO_ADMIN`）；与“不支持”区分，便于上层给出可行动的提示。
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyStatus {
     Applied,
     Skipped,
     Error,
+    Denied,
 }
 
 /// 与配置项一一对应的能力检查报告
@@ -196,6 +199,78 @@ impl NetworkPorts {
     }
 }
 
+/// 端口区间 `[lo, hi]` 是否被 `ranges` 的并集完整覆盖。
+/// Whether `[lo, hi]` is fully covered by the union of `ranges`.
+fn range_covered(ranges: &[PortRange], lo: u16, hi: u16) -> bool {
+    let mut cursor = lo;
+    loop {
+        let next_end = ranges
+            .iter()
+            .filter(|(a, b)| *a <= cursor && cursor <= *b)
+            .map(|(_, b)| *b)
+            .max();
+        match next_end {
+            None => return false,
+            // `end == u16::MAX` 时 `end >= hi` 恒成立（hi <= MAX），上一分支已覆盖，无需特判。
+            Some(end) if end >= hi => return true,
+            Some(end) => cursor = end + 1,
+        }
+    }
+}
+
+/// `ranges` 是否覆盖整个端口空间 `0..=65535`。
+/// Whether `ranges` covers the whole port space.
+fn ranges_cover_all(ranges: &[PortRange]) -> bool {
+    range_covered(ranges, 0, u16::MAX)
+}
+
+/// WASI sockets（L2，guest 可见的 `wasi:sockets`）配置。默认 `None`（完全禁用）。
+///
+/// 与 L1 的 [`SandboxConfig::network_ports`] 求交：L1 是进程级粗粒度封禁，L2 是
+/// guest 侧细粒度授权；两者同时出现时必须一致（见 [`SandboxConfig::validate`]）。
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WasiSockets {
+    /// 完全禁用 sockets（默认）
+    #[default]
+    None,
+    /// 仅允许连接这些远程端口（段）
+    Allow(Vec<PortRange>),
+    /// 允许除这些远程端口（段）外的全部
+    Deny(Vec<PortRange>),
+    /// 仅允许回环地址（任意端口）
+    LoopbackOnly,
+}
+
+/// WASI clocks（L2）。默认 `Host`（宿主时钟）；`Deterministic` 用于可复现运行。
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WasiClocks {
+    /// 使用宿主墙钟 / 单调钟（默认）
+    #[default]
+    Host,
+    /// 确定性时钟：wall 恒为 0；monotonic 初值取 seed 低位，**每次读取 +1ms**
+    /// （避免 guest 等待时间永不动而空转）。同 seed → 同序列，可复现。
+    ///
+    /// 未实现期许 / original aspiration: 最初设计期望 monotonic **恒为 0（完全冻结）**；
+    /// 当前为保证时间推进改为每次 +1ms。若将来需要严格冻结，需另行解决 guest 超时空转。
+    Deterministic(u128),
+}
+
+/// WASI random（L2）。默认 `Os`（安全流 `wasi:random/random` 用 OS 真随机）。
+///
+/// `Seeded` 只播种**非安全流**（`wasi:random/insecure` + `insecure-seed`），使其确定性、可复现；
+/// 安全流仍用 OS 播种的 CSPRNG，**不因种子降级为可预测**（符合 WASI 语义）。
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WasiRandom {
+    /// 宿主熵源（默认）：安全流 OS 真随机，非安全流 OS 播种 PRNG
+    #[default]
+    Os,
+    /// 播种非安全流（`wasi:random/insecure`）使其可复现；安全流保持真随机
+    Seeded(u128),
+}
+
 /// 一条路径访问规则（capability 式）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsRule {
@@ -224,7 +299,7 @@ pub enum WasiStdio {
     /// 继承宿主进程的对应流
     #[default]
     Inherit,
-    /// 捕获到内存（供后续结果通道读取；尚未接线检索）
+    /// 捕获到内存（run 后经结果通道取回；线程路径落回宿主 stdout，进程路径经 `wait_output` 取回）
     Capture,
     /// 丢弃（null）
     Null,
@@ -284,16 +359,25 @@ impl WasiPreopen {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxConfig {
     // ---- 文件系统 ----
-    /// 路径级文件访问白名单
+    /// 路径级文件访问白名单（设置 `fs_root` 时，这些路径在 chroot 之后解析，即相对新根）。
     pub fs_rules: FsAccess,
     /// 全局只读
     pub readonly_fs: bool,
     /// 完全封闭文件系统
     pub deny_file_access: bool,
-    /// 文件系统根重定向（要求特权/平台支持，否则 Error）
+    /// 文件系统根重定向（要求特权/平台支持，否则 Error）。设置后 `fs_rules` 路径按新根解析。
     pub fs_root: Option<PathBuf>,
-    /// 允许写系统临时目录
+    /// 允许写应用临时目录（worker 继承父进程 temp 路径；Linux 优先每用户 runtime）。
     pub temp_allow_write: bool,
+    /// 编译缓存目录（宿主侧解析，随配置传入 worker）。
+    ///
+    /// 由 [`SandboxConfig::enable_compile_cache`] 设置；为 `None` 表示不启用。
+    /// 启用时该目录会在 L1 密封/白名单模式下被加入读写白名单。
+    /// Compile-cache directory (resolved host-side and passed to the worker). Set by
+    /// [`SandboxConfig::enable_compile_cache`]; `None` means disabled. When enabled it is
+    /// added to the L1 read/write allowlist under sealed/allowlist modes.
+    #[serde(default)]
+    pub compile_cache_dir: Option<PathBuf>,
     // ---- 网络 ----
     /// 完全禁止网络
     pub deny_network: bool,
@@ -345,6 +429,20 @@ pub struct SandboxConfig {
     pub wasi_args: Vec<String>,
     /// WASI 预打开目录（细粒度 guest 路径 + 读写权限）
     pub wasi_preopens: Vec<WasiPreopen>,
+    /// WASI sockets（L2；默认 `None` 完全禁用）
+    pub wasi_sockets: WasiSockets,
+    /// 是否允许 `wasi:sockets/ip-name-lookup`（DNS 解析）；默认 false
+    pub wasi_ip_name_lookup: bool,
+    /// WASI clocks（L2；默认 `Host`）
+    pub wasi_clocks: WasiClocks,
+    /// WASI random（L2；默认 `Os`）
+    pub wasi_random: WasiRandom,
+    /// `wasi:random` 单次最大字节数；None = 引擎默认（64 MiB）
+    pub wasi_max_random_size: Option<u64>,
+    /// guest 初始工作目录（`wasi:cli` initial-cwd）；None = 引擎默认（"/"）
+    pub wasi_initial_cwd: Option<String>,
+    /// 是否允许 WASI 阻塞调用直接阻塞当前线程（false = 走 spawn_blocking）
+    pub wasi_allow_blocking_current_thread: bool,
 }
 
 impl Default for SandboxConfig {
@@ -367,6 +465,7 @@ impl Default for SandboxConfig {
             deny_file_access: true,
             fs_root: None,
             temp_allow_write: false,
+            compile_cache_dir: None,
             // 网络：默认完全关闭（显式 allow_network_ports / loopback_only / dns_only 放行）
             deny_network: true,
             network_ports: NetworkPorts::Default,
@@ -395,6 +494,13 @@ impl Default for SandboxConfig {
             wasi_env: Vec::new(),
             wasi_args: Vec::new(),
             wasi_preopens: Vec::new(),
+            wasi_sockets: WasiSockets::None,
+            wasi_ip_name_lookup: false,
+            wasi_clocks: WasiClocks::Host,
+            wasi_random: WasiRandom::Os,
+            wasi_max_random_size: None,
+            wasi_initial_cwd: None,
+            wasi_allow_blocking_current_thread: false,
         }
     }
 }
@@ -451,6 +557,11 @@ impl SandboxConfig {
                     .into(),
             );
         }
+        if self.compile_cache_dir.is_some() && self.fs_root.is_some() {
+            violations.push(
+                "compile_cache_dir 与 fs_root 冲突：chroot 后宿主缓存路径不可达".into(),
+            );
+        }
         if self.anti_debug && matches!(self.max_core_bytes, Some(n) if n != 0) {
             violations.push(
                 "anti_debug 与 max_core_bytes 互斥：anti_debug 强制禁止 core dump，\
@@ -461,6 +572,91 @@ impl SandboxConfig {
         if self.deny_exec && self.max_children.is_some() {
             violations
                 .push("deny_exec 与 max_children 互斥：deny_exec 已隐含 0 个子进程上限".into());
+        }
+        // L2 sockets 与 L1 网络求交：grant 给 guest 的网络能力不得超出 L1 已放行的范围。
+        // L1 视为“已放行网络”的条件：显式端口授权（Allow 是基线 deny 下的 grant），
+        // 或在基线下不设 deny_network。deny_network=true 且 network_ports 未 Allow → 未放行。
+        let l1_network_open =
+            !self.deny_network || matches!(self.network_ports, NetworkPorts::Allow(_));
+
+        match &self.wasi_sockets {
+            WasiSockets::None => {}
+            _ if !l1_network_open => violations.push(
+                "wasi_sockets 需要 L1 网络授权：deny_network=true 且 network_ports 未显式 Allow".into(),
+            ),
+            WasiSockets::Allow(ports) => match &self.network_ports {
+                NetworkPorts::Allow(l1_ports) => {
+                    for (lo, hi) in ports {
+                        if !l1_ports.iter().any(|(a, b)| lo >= a && hi <= b) {
+                            violations.push(format!(
+                                "wasi_sockets 端口 {lo}-{hi} 超出 L1 network_ports 授权"
+                            ));
+                        }
+                    }
+                }
+                NetworkPorts::Deny(l1_denied) => {
+                    for (lo, hi) in ports {
+                        if l1_denied.iter().any(|(a, b)| lo <= b && a <= hi) {
+                            violations.push(format!(
+                                "wasi_sockets 端口 {lo}-{hi} 与 L1 network_ports 拒绝项重叠"
+                            ));
+                        }
+                    }
+                }
+                NetworkPorts::Default => {}
+            },
+            // L2 `Deny(d2)` 放行“除 d2 外全部”；它不可能窄于 L1 `Allow(部分端口)`。
+            // L2 `Deny(d2)` allows everything outside `d2`; it cannot be narrower than an
+            // L1 `Allow(partial)` set.
+            WasiSockets::Deny(denied) => match &self.network_ports {
+                NetworkPorts::Default => {}
+                NetworkPorts::Allow(l1_ports) => {
+                    if !ranges_cover_all(l1_ports) {
+                        violations.push(
+                            "wasi_sockets::Deny 过宽：L1 network_ports::Allow 只授权了部分端口"
+                                .into(),
+                        );
+                    }
+                }
+                NetworkPorts::Deny(l1_denied) => {
+                    for (lo, hi) in l1_denied {
+                        if !range_covered(denied, *lo, *hi) {
+                            violations.push(format!(
+                                "wasi_sockets::Deny 未覆盖 L1 拒绝端口 {lo}-{hi}：L2 比 L1 更宽"
+                            ));
+                        }
+                    }
+                }
+            },
+            // L2 `LoopbackOnly` 回环任意端口；只有 L1 全放行（或不拒绝任何端口）时才不越权。
+            // L2 `LoopbackOnly` allows every loopback port; only safe when L1 allows all.
+            WasiSockets::LoopbackOnly => match &self.network_ports {
+                NetworkPorts::Default => {}
+                NetworkPorts::Allow(l1_ports) => {
+                    if !ranges_cover_all(l1_ports) {
+                        violations.push(
+                            "wasi_sockets::LoopbackOnly 过宽：L1 network_ports::Allow 未放行全部端口"
+                                .into(),
+                        );
+                    }
+                }
+                NetworkPorts::Deny(l1_denied) => {
+                    if !l1_denied.is_empty() {
+                        violations.push(
+                            "wasi_sockets::LoopbackOnly 与 L1 network_ports::Deny 冲突：回环任一端口可能落在拒绝项"
+                                .into(),
+                        );
+                    }
+                }
+            },
+        }
+        if self.wasi_ip_name_lookup && matches!(self.wasi_sockets, WasiSockets::None) {
+            violations.push(
+                "wasi_ip_name_lookup 与 wasi_sockets::None 冲突：禁用 sockets 时无法解析 DNS".into(),
+            );
+        }
+        if self.wasi_ip_name_lookup && !l1_network_open {
+            violations.push("wasi_ip_name_lookup 需要 L1 网络授权（deny_network/network_ports）".into());
         }
 
         violations
@@ -475,6 +671,7 @@ impl SandboxConfig {
             deny_file_access: false,
             fs_root: None,
             temp_allow_write: false,
+            compile_cache_dir: None,
             deny_network: false,
             network_ports: NetworkPorts::Default,
             localhost_only: false,
@@ -498,6 +695,13 @@ impl SandboxConfig {
             wasi_env: Vec::new(),
             wasi_args: Vec::new(),
             wasi_preopens: Vec::new(),
+            wasi_sockets: WasiSockets::Allow(vec![(0, 65535)]),
+            wasi_ip_name_lookup: true,
+            wasi_clocks: WasiClocks::Host,
+            wasi_random: WasiRandom::Os,
+            wasi_max_random_size: None,
+            wasi_initial_cwd: None,
+            wasi_allow_blocking_current_thread: true,
         }
     }
 
@@ -526,6 +730,22 @@ impl SandboxConfig {
         self
     }
 
+    /// 一次性设置 stdin/stdout/stderr 为同一模式（常见简写）。
+    ///
+    /// ```
+    /// use whitebox_core::sandbox::{SandboxConfig, WasiStdio};
+    /// let cfg = SandboxConfig::new().wasi_stdio(WasiStdio::Null);
+    /// assert_eq!(cfg.wasi_stdin, WasiStdio::Null);
+    /// assert_eq!(cfg.wasi_stdout, WasiStdio::Null);
+    /// assert_eq!(cfg.wasi_stderr, WasiStdio::Null);
+    /// ```
+    pub fn wasi_stdio(mut self, mode: WasiStdio) -> Self {
+        self.wasi_stdin = mode;
+        self.wasi_stdout = mode;
+        self.wasi_stderr = mode;
+        self
+    }
+
     /// 追加一条 WASI 环境变量（可重复调用）
     pub fn wasi_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.wasi_env.push((key.into(), value.into()));
@@ -538,7 +758,55 @@ impl SandboxConfig {
         self
     }
 
+    /// WASI sockets 策略（默认 `None`）。与 L1 `deny_network`/`network_ports` 求交，冲突见 `validate`。
+    pub fn wasi_sockets(mut self, policy: WasiSockets) -> Self {
+        self.wasi_sockets = policy;
+        self
+    }
+
+    /// WASI clocks 策略（默认 `Host`）。`Deterministic` 让 guest 看到固定时钟，便于可复现运行。
+    pub fn wasi_clocks(mut self, clocks: WasiClocks) -> Self {
+        self.wasi_clocks = clocks;
+        self
+    }
+
+    /// WASI random 策略（默认 `Os`）。`Seeded` 让 guest 看到确定性随机，便于可复现运行（**不安全**）。
+    pub fn wasi_random(mut self, random: WasiRandom) -> Self {
+        self.wasi_random = random;
+        self
+    }
+
+    /// 是否允许 `wasi:sockets/ip-name-lookup`（DNS 解析，默认禁用）
+    pub fn wasi_ip_name_lookup(mut self, enabled: bool) -> Self {
+        self.wasi_ip_name_lookup = enabled;
+        self
+    }
+
+    /// `wasi:random` 单次最大字节数（默认引擎值 64 MiB）
+    pub fn wasi_max_random_size(mut self, bytes: u64) -> Self {
+        self.wasi_max_random_size = Some(bytes);
+        self
+    }
+
+    /// guest 初始工作目录（`wasi:cli` initial-cwd，默认引擎值 "/"）
+    pub fn wasi_initial_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.wasi_initial_cwd = Some(cwd.into());
+        self
+    }
+
+    /// 是否允许 WASI 阻塞调用直接阻塞当前线程（默认 false，走 spawn_blocking）
+    pub fn wasi_allow_blocking_current_thread(mut self, enabled: bool) -> Self {
+        self.wasi_allow_blocking_current_thread = enabled;
+        self
+    }
+
     /// 追加一条 WASI 预打开目录（可重复调用）。宿主目录不可用/无权限 → 配置阶段报错终止。
+    ///
+    /// 注意：`SandboxConfig::default()` 默认 `deny_file_access = true`（L1 完全封闭文件系统），
+    /// 与预打开冲突——`validate()` 会拒绝。**只读场景请优先用
+    /// [`SandboxConfig::wasi_preopen_ro`]**：它会同步 L1 只读 + 路径白名单，避免全局解封；
+    /// 需要读写时再显式 `sealed_fs(false)` 并自行保证 L1 授权，或直接使用
+    /// [`SandboxConfig::open`]。
     pub fn wasi_preopen(
         mut self,
         host_path: impl Into<PathBuf>,
@@ -551,6 +819,35 @@ impl SandboxConfig {
         self
     }
 
+    /// 追加一条**只读**预打开，并同步收紧 L1 文件系统语义（可重复调用）。
+    ///
+    /// 内部一次完成：`deny_file_access=false`（解除全局封盘）+ `readonly_fs=true` +
+    /// 对 `host` 的 L1 读白名单 + L2 只读 preopen。集中实现 L1∩L2 不变量，避免调用方
+    /// 各自拼装导致“全局解封”之类的过度授权。Windows 的 L1 文件系统能力未实现，故
+    /// 跳过 L1 两项以免产生无意义的 “unsupported” 报告；L2 preopen 仍严格只读。
+    ///
+    /// Append a **read-only** preopen and keep L1 in sync: clear full sealing, force the
+    /// FS read-only, grant an L1 read rule for `host`, then register the L2 read-only
+    /// preopen. Centralizes the L1∩L2 invariant so callers cannot over-unseal by accident.
+    /// Windows has no L1 filesystem primitive, so the L1 bits are skipped there to avoid
+    /// spurious "unsupported" reports; the L2 preopen is still strictly read-only.
+    pub fn wasi_preopen_ro(
+        mut self,
+        host_path: impl Into<PathBuf>,
+        guest_path: impl Into<String>,
+    ) -> Self {
+        let host_path = host_path.into();
+        self.deny_file_access = false;
+        #[cfg(not(windows))]
+        {
+            self.readonly_fs = true;
+            self.fs_rules.push(FsRule::new(host_path.clone(), true, false));
+        }
+        self.wasi_preopens
+            .push(WasiPreopen::new(host_path, guest_path, true, false));
+        self
+    }
+
     /// 追加一条“只读某路径”规则（可重复调用）
     pub fn allow_fs_read(mut self, path: impl Into<PathBuf>) -> Self {
         self.fs_rules.push(FsRule::new(path.into(), true, false));
@@ -560,6 +857,87 @@ impl SandboxConfig {
     /// 追加一条“读写某路径”规则（可重复调用）
     pub fn allow_fs_read_write(mut self, path: impl Into<PathBuf>) -> Self {
         self.fs_rules.push(FsRule::new(path.into(), true, true));
+        self
+    }
+
+    /// 启用 wasmtime 编译缓存（简易选项）：宿主侧解析并创建 `<cache_dir>/wasmtime`，
+    /// 写入 [`SandboxConfig::compile_cache_dir`]，并在 L1 密封/白名单模式下把该目录加入
+    /// 读写白名单。
+    ///
+    /// 缓存放在**每用户 cache 目录**（portable 为 `<exe_dir>/cache`），不使用共享 `/tmp`；
+    /// Unix 上额外 `protect_dir` 收紧为属主专用（纵深防御）。
+    /// 不满足条件时**静默不启用**（返回原配置）：`fs_root`（chroot 后宿主路径不可达）、
+    /// `readonly_fs`（缓存无法写入）、`dir::cache_dir()` / `ensure_dir` / `protect_dir` 失败。
+    /// 未启用时可从 `compile_cache_dir == None` 观察到。
+    ///
+    /// Enable the wasmtime compile cache (simple option): resolve and create
+    /// `<cache_dir>/wasmtime` on the host, record it in `compile_cache_dir`, and add it to
+    /// the L1 read/write allowlist under sealed/allowlist modes. The cache lives in the
+    /// per-user cache dir (portable: `<exe_dir>/cache`), not shared `/tmp`; on Unix we also
+    /// `protect_dir` it as defense-in-depth. Silently stays disabled when
+    /// `fs_root`/`readonly_fs`/directory resolution/hardening fails.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn enable_compile_cache(self) -> Self {
+        self.enable_compile_cache_at(None)
+    }
+
+    /// 同 [`SandboxConfig::enable_compile_cache`]，但允许指定缓存目录（绝对路径）。
+    /// 目录仍会经 `ensure_dir`/`protect_dir` 收紧（缓存中毒防御不因覆盖而豁免）；
+    /// `dir_override` 为 `None` 时用默认 `<cache_dir>/wasmtime`。
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn enable_compile_cache_at(mut self, dir_override: Option<&Path>) -> Self {
+        // chroot 后宿主缓存路径不可达；全局只读则缓存无法写入。
+        if self.fs_root.is_some() || self.readonly_fs {
+            return self;
+        }
+        let dir = match dir_override {
+            Some(dir) => dir.to_path_buf(),
+            None => {
+                let Ok(cache_root) = crate::dir::cache_dir() else {
+                    return self;
+                };
+                cache_root.join("wasmtime")
+            }
+        };
+        if crate::dir::ensure_dir(&dir).is_err() {
+            return self;
+        }
+        // Unix：收紧为属主专用（纵深防御）；失败则不启用（fail-closed）。
+        // On Unix, tighten to owner-only as defense-in-depth; failure disables the cache.
+        #[cfg(unix)]
+        if crate::dir::protect_dir(&dir).is_err() {
+            return self;
+        }
+        // portable + Windows：缓存位于 `<exe_dir>/cache`，可能落在共享可写目录；同样收紧
+        // 为属主专用（TreeSet 递归，故只在 portable 模式下承担该成本）。
+        // portable + Windows: the cache lives under `<exe_dir>/cache` which may be shared;
+        // tighten it too (TreeSet is recursive, so only portable mode pays this).
+        #[cfg(windows)]
+        if cfg!(feature = "portable") && crate::dir::protect_dir(&dir).is_err() {
+            return self;
+        }
+        // 仅在 L1 已处于密封/白名单模式时追加规则；L1 全开时加规则反而会把沙箱收紧为
+        // “只允许缓存目录”。Windows 的 L1 文件系统能力未实现，加规则只会产生无意义的
+        // “unsupported” 报告，故跳过（缓存仍可被 worker 访问）。
+        // Add the rule only under sealed/allowlist L1; on Windows L1 fs is unimplemented and
+        // the rule would only produce a spurious "unsupported" report, so skip it there.
+        #[cfg(not(windows))]
+        if self.deny_file_access || !self.fs_rules.is_empty() {
+            self.fs_rules.push(FsRule::new(dir.clone(), true, true));
+        }
+        self.compile_cache_dir = Some(dir);
+        self
+    }
+
+    /// 移动端占位：目录布局未定义，暂不启用编译缓存。
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub fn enable_compile_cache(self) -> Self {
+        self
+    }
+
+    /// 移动端占位：同 [`SandboxConfig::enable_compile_cache`]。
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub fn enable_compile_cache_at(self, _dir_override: Option<&Path>) -> Self {
         self
     }
 
@@ -743,6 +1121,15 @@ pub(super) fn outcome(requested: bool, applied: bool) -> ApplyStatus {
 /// 该平台不支持此能力时，统一映射为：已请求 → Error，未请求 → Skipped
 pub(super) fn unsupported(requested: bool) -> ApplyStatus {
     outcome(requested, false)
+}
+
+/// 平台支持但权限不足时：已请求 → Denied，未请求 → Skipped
+pub(super) fn denied(requested: bool) -> ApplyStatus {
+    if requested {
+        ApplyStatus::Denied
+    } else {
+        ApplyStatus::Skipped
+    }
 }
 
 /// 按键登记的能力报告集合（扩展 / 维护的核心切面）。

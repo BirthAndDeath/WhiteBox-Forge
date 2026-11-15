@@ -9,6 +9,46 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use super::FsRule;
 
+/// 一次沙箱原语的结果，统一区分「成功 / 权限不足 / 其它失败」。
+///
+/// unix 侧所有 L1 原语（setrlimit / prctl / unshare / landlock / sandbox_init / ptrace）
+/// 在非特权环境下失败时多为 `EACCES`/`EPERM`——归为 `Denied`；其余归为 `Failed`（不支持）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyscallOutcome {
+    Applied,
+    Denied,
+    Failed,
+}
+
+impl SyscallOutcome {
+    /// 成功/失败判定，并在失败时**立即**读取 errno 分类（须紧邻 syscall，中间不得再调用 libc）。
+    pub fn from_ret(ret: i64) -> Self {
+        if ret == 0 {
+            return SyscallOutcome::Applied;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EACCES) | Some(libc::EPERM) => SyscallOutcome::Denied,
+            _ => SyscallOutcome::Failed,
+        }
+    }
+
+    pub fn is_applied(self) -> bool {
+        matches!(self, SyscallOutcome::Applied)
+    }
+}
+
+/// 把原语结果统一映射为 [`super::ApplyStatus`]（未请求时恒 `Skipped`）。
+pub fn status(requested: bool, outcome: SyscallOutcome) -> super::ApplyStatus {
+    if !requested {
+        return super::ApplyStatus::Skipped;
+    }
+    match outcome {
+        SyscallOutcome::Applied => super::ApplyStatus::Applied,
+        SyscallOutcome::Denied => super::ApplyStatus::Denied,
+        SyscallOutcome::Failed => super::ApplyStatus::Error,
+    }
+}
+
 /// 打开文件数上限（RLIMIT_NOFILE）。
 ///
 /// 注意：Linux glibc 的 `setrlimit` 首参类型是 `__rlimit_resource_t`(=`c_uint`)，
@@ -16,64 +56,68 @@ use super::FsRule;
 /// 调用点把 `libc::RLIMIT_*` 常量与 `libc::setrlimit` 直接配对使用，
 /// 类型同源即天然一致，cfg / 类型之间无冲突。
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-pub fn limit_open_files(max: u64) -> bool {
+pub fn limit_open_files(max: u64) -> SyscallOutcome {
     let limit = libc::rlimit {
         rlim_cur: max as libc::rlim_t,
         rlim_max: max as libc::rlim_t,
     };
-    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 }
+    SyscallOutcome::from_ret(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } as i64)
 }
 
 /// 最大 CPU 时间：毫秒 → 秒（向上取整）RLIMIT_CPU
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-pub fn limit_cpu_ms(max: u64) -> bool {
+pub fn limit_cpu_ms(max: u64) -> SyscallOutcome {
     let secs = max.div_ceil(1000).max(1);
     let limit = libc::rlimit {
         rlim_cur: secs as libc::rlim_t,
         rlim_max: secs as libc::rlim_t,
     };
-    unsafe { libc::setrlimit(libc::RLIMIT_CPU, &limit) == 0 }
+    SyscallOutcome::from_ret(unsafe { libc::setrlimit(libc::RLIMIT_CPU, &limit) } as i64)
 }
 
 /// 单文件写入大小上限（RLIMIT_FSIZE）；超限写会被 SIGXFSZ 终止
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-pub fn limit_file_size(max: u64) -> bool {
+pub fn limit_file_size(max: u64) -> SyscallOutcome {
     let limit = libc::rlimit {
         rlim_cur: max as libc::rlim_t,
         rlim_max: max as libc::rlim_t,
     };
-    unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == 0 }
+    SyscallOutcome::from_ret(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) } as i64)
 }
 
 /// 核心转储大小上限（RLIMIT_CORE）；0 表示关闭 core dump
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-pub fn limit_core_bytes(max: u64) -> bool {
+pub fn limit_core_bytes(max: u64) -> SyscallOutcome {
     let limit = libc::rlimit {
         rlim_cur: max as libc::rlim_t,
         rlim_max: max as libc::rlim_t,
     };
-    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) == 0 }
+    SyscallOutcome::from_ret(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } as i64)
 }
 
 /// 设置 no_new_privileges（Landlock / seccomp 的前置条件）
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn set_no_new_privileges() -> bool {
-    unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 }
+pub fn set_no_new_privileges() -> SyscallOutcome {
+    SyscallOutcome::from_ret(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } as i64)
 }
 
 /// 防调试：禁止被 ptrace 读取（PR_SET_DUMPABLE=0）并关闭 core dump
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn anti_debug() -> bool {
-    let dumpable = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } == 0;
-    dumpable && limit_core_bytes(0)
+pub fn anti_debug() -> SyscallOutcome {
+    let dumpable =
+        SyscallOutcome::from_ret(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } as i64);
+    if !dumpable.is_applied() {
+        return dumpable;
+    }
+    limit_core_bytes(0)
 }
 
 /// 完全禁止网络：unshare(CLONE_NEWNET) 进入新网络命名空间，
 /// 新命名空间里只有 lo 且默认 down，从而阻断全部外部网络。
-/// 需要 CAP_SYS_ADMIN；非特权用户会失败（返回 false → 对应项 Error）。
+/// 需要 CAP_SYS_ADMIN；非特权用户会失败（EPERM → 权限不足 = Denied）。
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn deny_network() -> bool {
-    unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_NEWNET) == 0 }
+pub fn deny_network() -> SyscallOutcome {
+    SyscallOutcome::from_ret(unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_NEWNET) } as i64)
 }
 
 /// Linux Landlock 文件系统限制（内核 >= 5.13，且需要先设置 no_new_privs 或持有 CAP_SYS_ADMIN）。
@@ -83,7 +127,7 @@ pub fn deny_network() -> bool {
 /// - `deny_exec`：不授予 EXECUTE 位 → 禁止执行；
 /// - `sealed`：完全不添加任何放行规则 → 封闭文件系统（全部 handled 访问被拒）；
 /// - `fs_rules`：非空时进入“路径白名单”能力模式，为每个路径添加权限规则；
-/// - `temp_allow_write`：额外放行系统临时目录的写入（用于只读 / 白名单组合）。
+/// - `temp_allow_write`：额外放行应用临时目录的写入（worker 继承父进程 temp 路径）。
 #[cfg(target_os = "linux")]
 pub fn landlock(
     readonly_fs: bool,
@@ -91,7 +135,7 @@ pub fn landlock(
     sealed: bool,
     fs_rules: &[FsRule],
     temp_allow_write: bool,
-) -> bool {
+) -> SyscallOutcome {
     const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
     const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
@@ -105,9 +149,15 @@ pub fn landlock(
     const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
     const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
     const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
+    // ABI 2（Linux 5.19+）/ ABI 3（Linux 6.2+）：不纳入 handled 会留下 rename/link、
+    // truncate 的绕过面。
+    const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
+    const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
     const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
     // PR_LANDLOCK_RESTRICT_SELF = 32（libc 尚未提供该常量）
     const PR_LANDLOCK_RESTRICT_SELF: i32 = 32;
+    // landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION) → ABI 版本
+    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 
     #[repr(C)]
     struct LandlockRulesetAttr {
@@ -120,7 +170,7 @@ pub fn landlock(
     }
 
     let read_bits = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
-    let write_bits = LANDLOCK_ACCESS_FS_WRITE_FILE
+    let mut write_bits = LANDLOCK_ACCESS_FS_WRITE_FILE
         | LANDLOCK_ACCESS_FS_REMOVE_DIR
         | LANDLOCK_ACCESS_FS_REMOVE_FILE
         | LANDLOCK_ACCESS_FS_MAKE_REG
@@ -133,6 +183,24 @@ pub fn landlock(
 
     // Landlock 需要本进程已设置 no_new_privs（或持有 CAP_SYS_ADMIN），这里补上（幂等）。
     let _ = set_no_new_privileges();
+
+    // 探测 ABI：REFER(≥2) / TRUNCATE(≥3) 在支持的内核上必须纳入 handled 并随写权限授予。
+    // Probe the ABI; on supporting kernels REFER/TRUNCATE must be handled and granted with
+    // write access, otherwise rename/link/truncate stay unmediated.
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<LandlockRulesetAttr>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION as usize,
+        )
+    };
+    if abi >= 2 {
+        write_bits |= LANDLOCK_ACCESS_FS_REFER;
+    }
+    if abi >= 3 {
+        write_bits |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    }
 
     let handled: u64 = LANDLOCK_ACCESS_FS_EXECUTE | read_bits | write_bits;
     let attr = LandlockRulesetAttr {
@@ -147,26 +215,27 @@ pub fn landlock(
         )
     };
     if ruleset < 0 {
-        return false;
+        return SyscallOutcome::from_ret(ruleset as i64);
     }
 
     // 添加一条 path_beneath 规则；失败即整体放弃
-    let add_rule = |parent_fd: i32, allowed: u64| -> bool {
+    let add_rule = |parent_fd: i32, allowed: u64| -> SyscallOutcome {
         let beneath = LandlockPathBeneathAttr {
             allowed_access: allowed,
             parent_fd,
         };
-        unsafe {
+        SyscallOutcome::from_ret(unsafe {
             libc::syscall(
                 libc::SYS_landlock_add_rule,
                 ruleset,
                 LANDLOCK_RULE_PATH_BENEATH,
                 &beneath as *const LandlockPathBeneathAttr,
                 0,
-            ) == 0
-        }
+            )
+        } as i64)
     };
 
+    let mut partial = false;
     if fs_rules.is_empty() {
         // 无路径白名单：sealed 时不添加任何规则 → 全部拒绝；非 sealed 时对 "/" 放行 read（+ 按需 write/exec）
         if !sealed {
@@ -178,74 +247,97 @@ pub fn landlock(
                 allowed |= LANDLOCK_ACCESS_FS_EXECUTE;
             }
             let root = unsafe { libc::open(c"/".as_ptr(), libc::O_PATH) };
-            let ok = root >= 0 && add_rule(root, allowed);
-            if root >= 0 {
-                unsafe { libc::close(root) };
-            }
-            if !ok {
+            if root < 0 {
+                let outcome = SyscallOutcome::from_ret(root as i64);
                 unsafe { libc::close(ruleset as i32) };
-                return false;
+                return outcome;
+            }
+            let outcome = add_rule(root, allowed);
+            unsafe { libc::close(root) };
+            if !outcome.is_applied() {
+                unsafe { libc::close(ruleset as i32) };
+                return outcome;
             }
         }
     } else {
         // 路径授权模式（sealed 基线上的显式 grant）：为每个授权路径添加能力规则，
         // 未授权的路径在基线（sealed/只读/禁执行）下依然被拒
         for rule in fs_rules {
-            if !rule.read && !rule.write {
-                continue;
-            }
-            let mut allowed = read_bits;
-            if rule.read && !deny_exec {
-                allowed |= LANDLOCK_ACCESS_FS_EXECUTE;
+            // 读权限必须由 rule.read 显式授予：write-only 规则不得顺带读到内容
+            let mut allowed = 0u64;
+            if rule.read {
+                allowed |= read_bits;
+                if !deny_exec {
+                    allowed |= LANDLOCK_ACCESS_FS_EXECUTE;
+                }
             }
             if rule.write && !readonly_fs {
                 allowed |= write_bits;
             }
+            if allowed == 0 {
+                // 无有效授权（空规则 / write-only 遇全局只读）
+                continue;
+            }
             let Ok(c_path) = CString::new(rule.path.as_os_str().as_bytes()) else {
+                partial = true;
                 continue;
             };
             let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH) };
             if fd < 0 {
-                continue; // 路径不存在或不可达：跳过（该条能力授予失败而非整体失败）
+                // 路径不存在或不可达：该条授权未生效，记为部分失败而非静默 Applied。
+                // Path missing/unreachable: mark partial instead of silently reporting Applied.
+                partial = true;
+                continue;
             }
-            let ok = add_rule(fd, allowed);
+            let outcome = add_rule(fd, allowed);
             unsafe { libc::close(fd) };
-            if !ok {
+            if !outcome.is_applied() {
                 unsafe { libc::close(ruleset as i32) };
-                return false;
+                return outcome;
             }
         }
     }
 
     // 临时目录写放行（sealed 基线上的显式 grant）
-    if temp_allow_write
-        && !readonly_fs
-        && let Ok(temp) = CString::new(std::env::temp_dir().as_os_str().as_bytes())
-    {
-        let fd = unsafe { libc::open(temp.as_ptr(), libc::O_PATH) };
-        if fd >= 0 {
-            let ok = add_rule(fd, read_bits | write_bits);
-            unsafe { libc::close(fd) };
-            if !ok {
-                unsafe { libc::close(ruleset as i32) };
-                return false;
+    if temp_allow_write && !readonly_fs {
+        match CString::new(std::env::temp_dir().as_os_str().as_bytes()) {
+            Ok(temp) => {
+                let fd = unsafe { libc::open(temp.as_ptr(), libc::O_PATH) };
+                if fd >= 0 {
+                    let outcome = add_rule(fd, read_bits | write_bits);
+                    unsafe { libc::close(fd) };
+                    if !outcome.is_applied() {
+                        unsafe { libc::close(ruleset as i32) };
+                        return outcome;
+                    }
+                } else {
+                    partial = true;
+                }
             }
+            Err(_) => partial = true,
         }
     }
 
     // 应用规则集到自身进程
     let rc = unsafe { libc::prctl(PR_LANDLOCK_RESTRICT_SELF, ruleset, 0, 0, 0) };
+    let outcome = SyscallOutcome::from_ret(rc as i64);
     unsafe { libc::close(ruleset as i32) };
-    rc == 0
+    if partial && outcome.is_applied() {
+        // 有授权未生效：不要报 Applied（fail-closed 语义）。
+        // Some grants were not applied: do not report Applied.
+        SyscallOutcome::Failed
+    } else {
+        outcome
+    }
 }
 
 /// seccomp 严格模式：仅对 x86_64 生效，安装 BPF 过滤器，
 /// 拒绝一组危险内核 / 进程自省类 syscall，其余全部放行。
 /// 前置条件也是 no_new_privs（或 CAP_SYS_ADMIN），这里自动补上。
 ///
-/// 其它架构不安装过滤器（返回 false → 该配置项 Error，保持“广兼容”）。
+/// 其它架构不安装过滤器（返回 Failed → 该配置项 Error，保持“广兼容”）。
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn strict_syscalls() -> bool {
+pub fn strict_syscalls() -> SyscallOutcome {
     #[cfg(target_arch = "x86_64")]
     {
         const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
@@ -254,7 +346,7 @@ pub fn strict_syscalls() -> bool {
         const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 
         // 拒之系统调用（x86_64 号）——进程/内核自省与特权操纵类
-        const DENIED: [u32; 24] = [
+        const DENIED: [u32; 38] = [
             101, // ptrace
             161, // chroot
             298, // perf_event_open
@@ -279,6 +371,20 @@ pub fn strict_syscalls() -> bool {
             246, // kexec_load
             320, // kexec_file_load
             155, // pivot_root
+            272, // unshare
+            308, // setns
+            425, // io_uring_setup
+            426, // io_uring_enter
+            427, // io_uring_register
+            428, // open_tree
+            429, // move_mount
+            430, // fsopen
+            431, // fsconfig
+            432, // fsmount
+            433, // fspick
+            438, // pidfd_getfd
+            440, // process_madvise
+            442, // mount_setattr
         ];
 
         #[derive(Clone, Copy)]
@@ -343,18 +449,18 @@ pub fn strict_syscalls() -> bool {
             len: prog.len() as u16,
             filter: prog.as_ptr(),
         };
-        unsafe {
+        SyscallOutcome::from_ret(unsafe {
             libc::prctl(
                 libc::PR_SET_SECCOMP,
                 SECCOMP_MODE_FILTER,
                 &fprog as *const SockFprog,
                 0,
                 0,
-            ) == 0
-        }
+            )
+        } as i64)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        false
+        SyscallOutcome::Failed
     }
 }

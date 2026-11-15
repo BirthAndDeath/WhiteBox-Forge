@@ -86,3 +86,22 @@
 - [x] **`SandboxHandle` 丢弃即清理** → `runner: Option<Runner>` + `Drop`：未 `wait*`/`shutdown` 就丢弃时，Process `kill`+`wait`，Thread 置标志 + 单次轻推 epoch（回调按各自 flag 判定，不误杀并发）。
 - [x] **协议帧上限 + 入口预校验** → `read_bytes` 限 64 MiB（防 u32 长度致 4 GiB 分配）；`run_source` / worker `run_worker` 应用前 `validate`，冲突返回可诊断错误而非 panic。
 - [x] **Windows Job 多余句柄关闭** → `JOB_HANDLE` 已存在时 `CloseHandle` 本次新建的句柄，避免泄漏。
+
+## 日志 / 目录 / 发布（2026-11-15）
+
+> 证据：`cargo check --workspace --all-targets` 零告警、`cargo test -p whitebox_core` 全绿。
+
+- [x] **`worker_log` 独立模块** → worker stderr 异步排空、转义（`\`/控制/非 ASCII→`\\`/`\n`/`\r`/`\t`/`\xNN`）、写入 `<cache_dir>/worker-<UTC day>.log`；单文件 1 MiB 轮换为 `worker-<day>-<pid>-<nanos>.log`；按 UTC 天数保留 7 天；锁串行化；失败后停止记录但仍排空。
+- [x] **stdout / stderr 策略** → CLI 只捕获 stdout、不写宿主；guest stderr 固定 `Null`；线程回退 stdout `Inherit→Capture`、stderr `Null`；库 `wait_output` 仍返回不可信字节。
+- [x] **`dir` 模块 + `portable`** → `get_dir`（桌面 `directories`、移动端 `todo!()`）、`protect_dir`（Unix fd/fchmod/inode；Windows TreeSet+reparse 拒绝）、`ensure_dir`（Unix 0700）；`portable` 全部落在 `<exe_dir>/{config,data,cache,run,state,tmp}`；`directories` 仅桌面依赖。
+- [x] **wasmtime 编译缓存** → 启用 `cache`；`enable_compile_cache()` 用 `<cache_dir>/wasmtime`（宿主解析、配置传给 worker）；Unix/portable-Windows `protect_dir`；L1 密封/白名单时加 fs 规则；`fs_root`/`readonly_fs` 下禁用；zstd 0.13.5 / zstd-safe 7.4.1 patched。
+- [x] **Windows Job 修正** → `JOBOBJECT_SECURITY_LIMIT_INFORMATION`（class 5）+ `JOB_OBJECT_SECURITY_NO_ADMIN=0x1`；`ActiveProcessLimit=max_children+1`；CPU 100ns checked；`JOB_ASSIGNED` 防重复 assign。
+- [x] **macOS / Linux 硬化** → seatbelt 路径转义/控制字符拒绝 + partial→Error；Landlock ABI 探测（REFER/TRUNCATE）+ partial→Error；seccomp 黑名单 38 项。
+- [x] **release workflow** → `security`（cargo-deny）+ `verify`（check/test）前置；失败 `cleanup` 删除 run 内 workflow artifacts（1 天兜底）；Slint Linux 依赖 composite action。
+
+### 用户配置 / 清理（2026-11-15）
+
+- [x] **用户 JSON 配置** → 新增 `config` 模块：`dir::config_dir()` 下 `run/limits/logging/caching` 四个 JSON（仓库 `config/*.json` 为模板），`serde_json` + `deny_unknown_fields`；缺失=内置默认、非法=拒绝启动（fail-closed）；wait 轮询/宽限与日志轮换/保留改为可配；`limits.json` 映射 `SandboxConfig::max_*`（沙箱模式生效）；`caching.json` 控制缓存开关与目录；优先级 内置 < JSON < CLI < 库 API。
+- [x] **目录/依赖清理** → 删除未使用的 `oci-spec` 依赖；删除空的 `src/network/` 目录。
+- [x] **`finished` 标记 panic 加固** → 线程回退用 Drop guard 置位，panic 路径下 `wait_timeout`/`shutdown` 不再误报超时。
+- [x] **死分支清理** → `range_covered` 移除不可达的 `end == u16::MAX` 分支。
