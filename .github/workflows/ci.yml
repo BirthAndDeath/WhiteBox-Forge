@@ -31,7 +31,7 @@ jobs:
         run: cargo audit
 
   cargo-deny:
-    name: cargo deny (gate: advisories/bans/sources)
+    name: "cargo deny (gate: advisories/bans/sources)"
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
