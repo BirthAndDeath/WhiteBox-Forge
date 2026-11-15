@@ -1,0 +1,100 @@
+name: dependency-audit
+
+# 依赖安全单一入口：
+# - PR / push(main)：跑 `cargo audit` 作**信息报告**（非门禁；deny 才是 tag 发布门禁）；
+# - 每周定时 / 手动：审计检出漏洞时才 `cargo audit fix` → 预检 → 开 PR 供人工合并。
+# 干净即停（不制造空 PR）；不自动合并（补丁版可能改行为，PR 走仓库 checks + 人工）。
+# RustSec 数据库/基础设施故障（退出码 ≠ 0/1）不会误触发 fix。
+#
+# One place for dependency security:
+# - PRs / pushes to main run `cargo audit` as an informational report (not a gate;
+#   `deny` is the release gate);
+# - weekly schedule / manual dispatch run `cargo audit fix` and open a PR for a human
+#   merge only when vulnerabilities were found. A clean tree creates no PR; no
+#   auto-merge; infra errors (exit code not 0/1) never trigger a fix.
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'      # 每周一 03:00 UTC
+  workflow_dispatch: {}      # 手动触发
+  pull_request:              # PR 信息报告
+  push:
+    branches: [main]         # main 推送信息报告
+
+permissions:
+  contents: read             # 默认最小化
+
+concurrency:
+  group: dependency-audit-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write        # 建分支/提交（仅定时/手动修复开 PR 时使用）
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          # 锁 0.21 线（fix 子命令自 0.21 起），避免 CLI 漂移；同装 cargo-deny 用于修复树校验
+          tools: cargo-audit@0.21, cargo-deny
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo audit
+        id: audit
+        shell: bash
+        run: |
+          set +e
+          cargo audit
+          rc=$?
+          set -e
+          case $rc in
+            0)
+              echo "clean=true" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "clean=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # RustSec DB / 网络 / 其它基础设施故障：不当作漏洞，避免误跑 fix。
+              echo "clean=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::cargo audit exited $rc (infra, not a vulnerability)" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+
+      # 仅定时/手动且检出漏洞时才 fix + 开 PR；PR/push 只做上面的报告。
+      - name: auto-fix safely fixable issues
+        if: steps.audit.outputs.clean == 'false' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        run: cargo audit fix || true
+
+      # 早期信号（不阻塞开 PR）：与发布门禁同标准——check + test + deny。
+      # “可修但构建失败/违反 bans/licenses”的修复必须开成 PR 让人类看到失败原因，
+      # 故 continue-on-error：失败仍照常开 PR，PR 自带的 checks 再权威复验一遍。
+      - name: verify the fixed tree (early signal)
+        if: steps.audit.outputs.clean == 'false' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --all-targets
+          cargo test --locked -p whitebox_core
+          cargo deny check advisories bans sources
+
+      # 有实际变更才开 PR；无变更则 no-op（不会制造空 PR）。
+      - name: open PR with the dependency fixup
+        if: steps.audit.outputs.clean == 'false' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: deps/rustsec-fix
+          title: 'chore(deps): cargo audit fixup'
+          commit-message: 'chore(deps): cargo audit fixup'
+          body: |
+            `cargo audit fix` 自动工期后的依赖更新（仅 Cargo.lock，极少 Cargo.toml）。
+
+            - 本 PR 的合并门禁由仓库既有 checks 验证（`cargo check --locked --workspace --all-targets` + `cargo test --locked -p whitebox_core`）。
+            - 无法自动修复（无补丁版 / 需主线升级 / 版本约束冲突）的通告见本次运行日志
+              `cargo audit` 步骤。
+          delete-branch: true

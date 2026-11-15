@@ -64,7 +64,7 @@
 
 - [ ] **abandon 线程无上限**：`wait_timeout` 超时后线程泄漏（有界但可累积）。
   - 改：统计 abandoned 线程数，超阈值拒绝新线程运行。
-- [ ] **CI 尚未加固**：已加 `cargo-deny` **门禁**（`advisories/bans/sources`）+ `cargo-audit` **信息报告**（`continue-on-error`）；`test-matrix` 未实跑；clippy 仍 advisory。
+- [ ] **CI 尚未加固**：已加 `cargo-deny` **门禁**（`advisories/bans/sources`，security job，tag/手动触发）+ `cargo-audit` **信息报告**（`dependency-audit.yml`：PR/push + 每周定时，检出漏洞才 `fix` 开 PR；非门禁）；`test-matrix` 未实跑；clippy 仍 advisory。
   - 剩余：`cargo fmt --check`、MSRV、`-D warnings` 策略；`deny.toml` 的 `licenses` 段（Slint 多许可证/GPL）待评审后决定是否进门禁。
 - [ ] **无 property/fuzz 测试**：`validate`（区间求交、互斥）适合 proptest。
 - [ ] **错误类型不统一**：`wasmtime::Error` / `anyhow` / `WorkerError` 混用，边界转换散布。
