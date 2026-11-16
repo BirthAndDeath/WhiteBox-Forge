@@ -109,7 +109,7 @@ jobs:
           Copy-Item README.md, LICENSE dist/
           Compress-Archive -Path dist/* -DestinationPath "whitebox-forge-$env:RUNNER_OS-$env:RUNNER_ARCH.zip" -Force
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: whitebox-forge-${{ runner.os }}-${{ runner.arch }}
           path: whitebox-forge-*
@@ -130,7 +130,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -158,7 +158,7 @@ jobs:
           done
           echo "all three platform artifacts present"
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
@@ -178,7 +178,7 @@ jobs:
       actions: write
     steps:
       - name: delete workflow artifacts
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const artifacts = await github.paginate(
