@@ -36,7 +36,7 @@ jobs:
       contents: write        # 建分支/提交（仅定时/手动修复开 PR 时使用）
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
         with:
           # 锁 0.21 线（fix 子命令自 0.21 起），避免 CLI 漂移；同装 cargo-deny 用于修复树校验
@@ -86,7 +86,7 @@ jobs:
       # 有实际变更才开 PR；无变更则 no-op（不会制造空 PR）。
       - name: open PR with the dependency fixup
         if: steps.audit.outputs.clean == 'false' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: deps/rustsec-fix
           title: 'chore(deps): cargo audit fixup'
